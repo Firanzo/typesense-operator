@@ -1,4 +1,10 @@
 controllerManager:
+  # Restrict the operator to watch a specific target namespace (e.g. run in namespace X, watch namespace Y).
+  watchNamespace: ""
+  # Restrict the operator to watch only the namespace it is deployed in (run in X, watch X).
+  watchCurrentNamespace: false
+  # Allow webhooks to be created and grant cluster-wide validatingwebhookconfiguration permissions even in gapped mode.
+  enableWebhooksInGappedMode: false
   manager:
     args:
     - --metrics-bind-address=:8443
@@ -11,8 +17,8 @@ controllerManager:
         drop:
         - ALL
     image:
-      repository: quay.io/akyriako/typesense-operator
-      tag: 0.4.1-rc.4
+      repository: example.com/typesense-operator
+      tag: v0.0.1
     imagePullPolicy: IfNotPresent
     resources:
       limits:
@@ -21,12 +27,12 @@ controllerManager:
       requests:
         cpu: 10m
         memory: 64Mi
+  nodeSelector: {}
   podSecurityContext:
     runAsNonRoot: true
   replicas: 1
-  serviceAccount:
-    annotations: {}
-imagePullSecrets: []
+  tolerations: []
+  topologySpreadConstraints: []
 kubernetesClusterDomain: cluster.local
 metricsService:
   ports:
@@ -35,3 +41,15 @@ metricsService:
     protocol: TCP
     targetPort: 8443
   type: ClusterIP
+serviceAccount:
+  annotations: {}
+  automount: true
+  create: true
+  name: ""
+webhookService:
+  ports:
+  - port: 443
+    protocol: TCP
+    targetPort: 9443
+  type: ClusterIP
+imagePullSecrets: []

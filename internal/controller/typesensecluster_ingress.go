@@ -24,30 +24,48 @@ import (
 )
 
 const (
-	confTemplate = `events {}
-		http {
-		  {{- if .HttpDirectives}}
-		  {{.HttpDirectives}}
-		  {{- end}}
-		  server {
-			listen 80;
+	confTemplate = `worker_processes auto;
+pid /tmp/nginx.pid;
+events {
+  worker_connections 1024;
+}
+http {
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 65;
+  types_hash_max_size 2048;
+  server_tokens off;
 
-			{{- if .Referer}}
-			{{.Referer}}
-			{{- end}}
-			{{- if .ServerDirectives}}
-			{{.ServerDirectives}}
-			{{- end}}
-			location / {
-			  proxy_pass http://{{.ServiceName}}-svc:{{.ServicePort}}/;
-			  proxy_pass_request_headers on;
+  {{- if .HttpDirectives}}
+  {{.HttpDirectives}}
+  {{- end}}
 
-			  {{- if .LocationDirectives}}
-			  {{.LocationDirectives}}
-			  {{- end}}
-			}
-		  }
-		}`
+  server {
+    listen 8080;
+
+    {{- if .Referer}}
+    {{.Referer}}
+    {{- end}}
+    {{- if .ServerDirectives}}
+    {{.ServerDirectives}}
+    {{- end}}
+    location / {
+      proxy_pass http://{{.ServiceName}}-svc:{{.ServicePort}}/;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header Connection "";
+      proxy_pass_request_headers on;
+
+      {{- if .LocationDirectives}}
+      {{.LocationDirectives}}
+      {{- end}}
+    }
+  }
+}`
 
 	referer = `valid_referers server_names %s;
 					if ($invalid_referer) {
@@ -55,8 +73,12 @@ const (
 					}`
 )
 
-const clusterIssuerAnnotationKey = "cert-manager.io/cluster-issuer"
+const (
+	clusterIssuerAnnotationKey = "cert-manager.io/cluster-issuer"
+	nginxConfKey               = "nginx.conf"
+)
 
+//nolint:gocyclo // ReconcileIngress coordinates multiple child resources
 func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *tsv1alpha1.TypesenseCluster) (err error) {
 	r.logger.V(debugLevel).Info("reconciling ingress")
 
@@ -74,20 +96,18 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 		}
 	}
 
-	if ingressExists && (ts.Spec.Ingress == nil || ts.Spec.HttpRoutes != nil) {
-		return r.deleteIngress(ctx, ig)
-	} else if !ingressExists && ts.Spec.Ingress == nil {
-		return nil
-	}
-
-	if ts.Spec.HttpRoutes != nil {
-		return nil
+	if ts.Spec.Ingress == nil || ts.Spec.HttpRoutes != nil {
+		err := r.cleanupReverseProxy(ctx, ts)
+		if err != nil {
+			r.logger.Error(err, "failed to clean up reverse proxy resources")
+		}
+		return err
 	}
 
 	if !ingressExists {
 		r.logger.V(debugLevel).Info("creating ingress", "ingress", ingressObjectKey.Name)
 
-		ig, err = r.createIngress(ctx, ingressObjectKey, ts)
+		_, err = r.createIngress(ctx, ingressObjectKey, ts)
 		if err != nil {
 			r.logger.Error(err, "creating ingress failed", "ingress", ingressObjectKey.Name)
 			return err
@@ -96,24 +116,32 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 		lbls := r.getIngressLabels(ig, ts, ingressObjectKey)
 		anons := r.getIngressAnnotations(ig, ts)
 
-		if ts.Spec.Ingress.Host != ig.Spec.Rules[0].Host ||
+		pathType := ts.Spec.Ingress.PathType
+		if pathType == nil {
+			pathType = ptr.To(networkingv1.PathTypePrefix)
+		}
+
+		if len(ig.Spec.Rules) != 1 ||
+			ig.Spec.Rules[0].HTTP == nil ||
+			len(ig.Spec.Rules[0].HTTP.Paths) != 1 ||
+			ts.Spec.Ingress.Host != ig.Spec.Rules[0].Host ||
 			(ts.Spec.Ingress.ClusterIssuer != nil && *ts.Spec.Ingress.ClusterIssuer != ig.Annotations[clusterIssuerAnnotationKey]) ||
 			!apiequality.Semantic.DeepEqual(ts.Spec.Ingress.Labels, lbls) ||
 			!apiequality.Semantic.DeepEqual(ts.Spec.Ingress.Annotations, anons) ||
-			(ts.Spec.Ingress.TLSSecretName != nil && *ts.Spec.Ingress.TLSSecretName != ig.Spec.TLS[0].SecretName) ||
-			ts.Spec.Ingress.IngressClassName != *ig.Spec.IngressClassName ||
-			ts.Spec.Ingress.Path != ig.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Path ||
-			*ts.Spec.Ingress.PathType != *ig.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].PathType {
+			(ts.Spec.Ingress.TLSSecretName != nil && (len(ig.Spec.TLS) == 0 || *ts.Spec.Ingress.TLSSecretName != ig.Spec.TLS[0].SecretName)) ||
+			(ts.Spec.Ingress.TLSSecretName == nil && ts.Spec.Ingress.ClusterIssuer == nil && len(ig.Spec.TLS) > 0) ||
+			ig.Spec.IngressClassName == nil || ts.Spec.Ingress.IngressClassName != *ig.Spec.IngressClassName ||
+			ts.Spec.Ingress.Path != ig.Spec.Rules[0].HTTP.Paths[0].Path ||
+			ig.Spec.Rules[0].HTTP.Paths[0].PathType == nil || *pathType != *ig.Spec.Rules[0].HTTP.Paths[0].PathType {
 
 			r.logger.V(debugLevel).Info("updating ingress", "ingress", ingressObjectKey.Name)
 
-			ig, err = r.updateIngress(ctx, *ig, ts)
+			_, err = r.updateIngress(ctx, *ig, ts)
 			if err != nil {
 				r.logger.Error(err, "updating ingress failed", "ingress", ingressObjectKey.Name)
 				return err
 			}
 		}
-
 	}
 
 	configMapName := fmt.Sprintf(ClusterReverseProxyConfigMap, ts.Name)
@@ -134,7 +162,7 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 	if !configMapExists {
 		r.logger.V(debugLevel).Info("creating ingress config map", "configmap", configMapObjectKey.Name)
 
-		_, err = r.createIngressConfigMap(ctx, configMapObjectKey, ts, ig)
+		_, err = r.createIngressConfigMap(ctx, configMapObjectKey, ts)
 		if err != nil {
 			r.logger.Error(err, "creating ingress config map failed", "configmap", configMapObjectKey.Name)
 			return err
@@ -158,92 +186,99 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 	}
 
 	deploymentName := fmt.Sprintf(ClusterReverseProxy, ts.Name)
-	deploymentExists := true
-	deploymentObjectKey := client.ObjectKey{Namespace: ts.Namespace, Name: deploymentName}
 
-	var deployment = &appsv1.Deployment{}
-	if err := r.Get(ctx, deploymentObjectKey, deployment); err != nil {
-		if apierrors.IsNotFound(err) {
-			deploymentExists = false
-		} else {
-			r.logger.Error(err, fmt.Sprintf("unable to fetch ingress reverse proxy deployment: %s", deploymentName))
-			return err
+	volumes := r.getDefaultReverseProxyVolumes(ts.Name)
+	volumeMounts := r.getDefaultReverseProxyVolumeMounts()
+	var securityContext *v1.SecurityContext
+
+	volumes = append(volumes, ts.Spec.Ingress.Volumes...)
+	volumeMounts = append(volumeMounts, ts.Spec.Ingress.VolumeMounts...)
+
+	if ts.Spec.Ingress.SecurityContext != nil {
+		securityContext = ts.Spec.Ingress.SecurityContext
+	} else if ts.Spec.Ingress.ReadOnlyRootFilesystem {
+		securityContext = &v1.SecurityContext{
+			ReadOnlyRootFilesystem: ptr.To(true),
 		}
 	}
 
-	if !deploymentExists {
-		r.logger.V(debugLevel).Info("creating ingress reverse proxy deployment", "deployment", deploymentObjectKey.Name)
+	replicas := int32(1)
+	if ts.Spec.Ingress.Replicas != nil {
+		replicas = *ts.Spec.Ingress.Replicas
+	}
 
-		_, err = r.createIngressDeployment(ctx, deploymentObjectKey, ts, ig)
-		if err != nil {
-			r.logger.Error(err, "creating ingress reverse proxy deployment failed", "deployment", deploymentObjectKey.Name)
-			return err
-		}
-	} else {
-		desiredResources := ts.Spec.Ingress.GetReverseProxyResources()
-		deploymentResourcesNeedUpdate := !apiequality.Semantic.DeepEqual(desiredResources, deployment.Spec.Template.Spec.Containers[0].Resources)
-		if deploymentResourcesNeedUpdate {
-			deployment.Spec.Template.Spec.Containers[0].Resources = desiredResources
-		}
+	podAnnotations := make(map[string]string)
+	if configMapUpdated {
+		podAnnotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+	}
 
-		deploymentImageNeedUpdate := !apiequality.Semantic.DeepEqual(ts.Spec.Ingress.Image, deployment.Spec.Template.Spec.Containers[0].Image)
-		if deploymentImageNeedUpdate {
-			deployment.Spec.Template.Spec.Containers[0].Image = ts.Spec.Ingress.Image
-		}
+	desiredDeployment := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: getReverseProxyObjectMeta(ts, &deploymentName, nil),
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(replicas),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: getReverseProxyLabels(ts),
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      getMergedLabels(getDefaultLabels(ts), getReverseProxyLabels(ts)),
+					Annotations: podAnnotations,
+				},
+				Spec: v1.PodSpec{
+					ImagePullSecrets: ts.Spec.ImagePullSecrets,
+					Containers: []v1.Container{
+						{
+							Name:    fmt.Sprintf(ClusterReverseProxy, ts.Name),
+							Image:   ts.Spec.Ingress.Image,
+							Command: ts.Spec.Ingress.Command,
+							Ports: []v1.ContainerPort{
+								{
+									ContainerPort: 8080,
+								},
+							},
+							Resources:       ts.Spec.Ingress.GetReverseProxyResources(),
+							VolumeMounts:    volumeMounts,
+							SecurityContext: securityContext,
+							LivenessProbe: &v1.Probe{
+								ProbeHandler: v1.ProbeHandler{
+									TCPSocket: &v1.TCPSocketAction{
+										Port: intstr.IntOrString{Type: intstr.Int, IntVal: int32(8080)},
+									},
+								},
+								InitialDelaySeconds: 5,
+								TimeoutSeconds:      5,
+								PeriodSeconds:       10,
+							},
+							ReadinessProbe: &v1.Probe{
+								ProbeHandler: v1.ProbeHandler{
+									TCPSocket: &v1.TCPSocketAction{
+										Port: intstr.IntOrString{Type: intstr.Int, IntVal: int32(8080)},
+									},
+								},
+								InitialDelaySeconds: 5,
+								TimeoutSeconds:      5,
+								PeriodSeconds:       10,
+							},
+						},
+					},
+					Volumes: volumes,
+				},
+			},
+		},
+	}
 
-		readOnlyRootFilesystemSpecsNeedUpdate := false
-		if ts.Spec.Ingress.ReadOnlyRootFilesystem == nil {
-			if deployment.Spec.Template.Spec.Containers[0].SecurityContext != nil {
-				readOnlyRootFilesystemSpecsNeedUpdate = true
-				deployment.Spec.Template.Spec.Containers[0].SecurityContext = nil
-				deployment.Spec.Template.Spec.Volumes = r.getDefaultReverseProxyVolumes(ts.Name)
-				deployment.Spec.Template.Spec.Containers[0].VolumeMounts = r.getDefaultReverseProxyVolumeMounts()
-			}
-		} else {
-			securityContext := ts.Spec.Ingress.ReadOnlyRootFilesystem.SecurityContext
-			if securityContext == nil {
-				securityContext = &v1.SecurityContext{
-					ReadOnlyRootFilesystem: ptr.To(true),
-				}
-			}
+	if err := ctrl.SetControllerReference(ts, desiredDeployment, r.Scheme); err != nil {
+		return err
+	}
 
-			if !apiequality.Semantic.DeepEqual(securityContext, deployment.Spec.Template.Spec.Containers[0].SecurityContext) {
-				readOnlyRootFilesystemSpecsNeedUpdate = true
-				deployment.Spec.Template.Spec.Containers[0].SecurityContext = securityContext
-			}
-
-			desiredVolumes := r.getDefaultReverseProxyVolumes(ts.Name)
-			desiredVolumes = append(desiredVolumes, ts.Spec.Ingress.ReadOnlyRootFilesystem.Volumes...)
-
-			existingVolumes := deployment.Spec.Template.Spec.Volumes
-			if needsSyncVolumes(desiredVolumes, existingVolumes) {
-				readOnlyRootFilesystemSpecsNeedUpdate = true
-				deployment.Spec.Template.Spec.Volumes = desiredVolumes
-			}
-
-			desiredMounts := r.getDefaultReverseProxyVolumeMounts()
-			desiredMounts = append(desiredMounts, ts.Spec.Ingress.ReadOnlyRootFilesystem.VolumeMounts...)
-
-			existingMounts := deployment.Spec.Template.Spec.Containers[0].VolumeMounts
-			if needsSyncMounts(desiredMounts, existingMounts) {
-				readOnlyRootFilesystemSpecsNeedUpdate = true
-				deployment.Spec.Template.Spec.Containers[0].VolumeMounts = desiredMounts
-			}
-		}
-
-		if configMapUpdated || deploymentResourcesNeedUpdate || deploymentImageNeedUpdate || readOnlyRootFilesystemSpecsNeedUpdate {
-			if deployment.Spec.Template.Annotations == nil {
-				deployment.Spec.Template.Annotations = make(map[string]string)
-			}
-
-			r.logger.V(debugLevel).Info("adding restart annotation to ingress reverse proxy deployment", "deployment", deploymentObjectKey.Name)
-			deployment.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
-
-			if err := r.Update(ctx, deployment); err != nil {
-				r.logger.Error(err, "adding restart annotation to ingress reverse proxy deployment failed", "deployment", deploymentObjectKey.Name)
-				return err
-			}
-		}
+	//nolint:staticcheck
+	if err := r.Patch(ctx, desiredDeployment, client.Apply, client.ForceOwnership, client.FieldOwner("typesense-operator")); err != nil {
+		r.logger.Error(err, "updating ingress reverse proxy deployment failed", "deployment", deploymentName)
+		return err
 	}
 
 	serviceName := fmt.Sprintf(ClusterReverseProxyService, ts.Name)
@@ -263,18 +298,61 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 	if !serviceExists {
 		r.logger.V(debugLevel).Info("creating ingress reverse proxy service", "service", serviceNameObjectKey.Name)
 
-		_, err = r.createIngressService(ctx, serviceNameObjectKey, ts, ig)
+		_, err = r.createIngressService(ctx, serviceNameObjectKey, ts)
 		if err != nil {
 			r.logger.Error(err, "creating ingress reverse proxy service failed", "service", serviceNameObjectKey.Name)
 			return err
 		}
 	} else {
-		if !apiequality.Semantic.DeepEqual(service.Annotations, ts.Spec.Ingress.ServiceAnnotations) {
+		svcType := v1.ServiceTypeNodePort
+		if ts.Spec.Ingress.ServiceType != "" {
+			svcType = ts.Spec.Ingress.ServiceType
+		}
+		portsMatch := len(service.Spec.Ports) > 0 && service.Spec.Ports[0].Port == 8080 && service.Spec.Ports[0].TargetPort.IntVal == 8080
+
+		svcAnnotations := r.getServiceAnnotations(service, ts)
+		if !apiequality.Semantic.DeepEqual(svcAnnotations, ts.Spec.Ingress.ServiceAnnotations) || service.Spec.Type != svcType || !portsMatch {
 			err = r.updateIngressService(ctx, service, ts)
 			if err != nil {
 				r.logger.Error(err, "updating ingress reverse proxy service failed", "service", serviceNameObjectKey.Name)
 				return err
 			}
+		}
+	}
+
+	return nil
+}
+
+func (r *TypesenseClusterReconciler) cleanupReverseProxy(ctx context.Context, ts *tsv1alpha1.TypesenseCluster) error {
+	ingressName := fmt.Sprintf(ClusterReverseProxyIngress, ts.Name)
+	ig := &networkingv1.Ingress{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ts.Namespace, Name: ingressName}, ig); err == nil {
+		if err := r.Delete(ctx, ig); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	deployName := fmt.Sprintf(ClusterReverseProxy, ts.Name)
+	deploy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ts.Namespace, Name: deployName}, deploy); err == nil {
+		if err := r.Delete(ctx, deploy); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	svcName := fmt.Sprintf(ClusterReverseProxyService, ts.Name)
+	svc := &v1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ts.Namespace, Name: svcName}, svc); err == nil {
+		if err := r.Delete(ctx, svc); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	cmName := fmt.Sprintf(ClusterReverseProxyConfigMap, ts.Name)
+	cm := &v1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ts.Namespace, Name: cmName}, cm); err == nil {
+		if err := r.Delete(ctx, cm); client.IgnoreNotFound(err) != nil {
+			return err
 		}
 	}
 
@@ -303,16 +381,27 @@ func (r *TypesenseClusterReconciler) createIngress(ctx context.Context, key clie
 		tlsSecretName = *ts.Spec.Ingress.TLSSecretName
 	}
 
+	var ingressTLS []networkingv1.IngressTLS
+	if tlsSecretName != "" {
+		ingressTLS = []networkingv1.IngressTLS{
+			{
+				Hosts:      []string{ts.Spec.Ingress.Host},
+				SecretName: tlsSecretName,
+			},
+		}
+	}
+	// --------------------------------
+
+	pathType := ts.Spec.Ingress.PathType
+	if pathType == nil {
+		pathType = ptr.To(networkingv1.PathTypePrefix)
+	}
+
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: getIngressObjectMeta(ts, &key.Name, ts.Spec.Ingress.Labels, ts.Spec.Ingress.Annotations),
 		Spec: networkingv1.IngressSpec{
 			IngressClassName: ptr.To(ts.Spec.Ingress.IngressClassName),
-			TLS: []networkingv1.IngressTLS{
-				{
-					Hosts:      []string{ts.Spec.Ingress.Host},
-					SecretName: tlsSecretName,
-				},
-			},
+			TLS:              ingressTLS,
 			Rules: []networkingv1.IngressRule{
 				{
 					Host: ts.Spec.Ingress.Host,
@@ -321,12 +410,12 @@ func (r *TypesenseClusterReconciler) createIngress(ctx context.Context, key clie
 							Paths: []networkingv1.HTTPIngressPath{
 								{
 									Path:     ts.Spec.Ingress.Path,
-									PathType: ts.Spec.Ingress.PathType,
+									PathType: pathType,
 									Backend: networkingv1.IngressBackend{
 										Service: &networkingv1.IngressServiceBackend{
 											Name: fmt.Sprintf(ClusterReverseProxyService, ts.Name),
 											Port: networkingv1.ServiceBackendPort{
-												Number: 80,
+												Number: 8080,
 											},
 										},
 									},
@@ -353,14 +442,21 @@ func (r *TypesenseClusterReconciler) createIngress(ctx context.Context, key clie
 }
 
 func (r *TypesenseClusterReconciler) updateIngress(ctx context.Context, ig networkingv1.Ingress, ts *tsv1alpha1.TypesenseCluster) (*networkingv1.Ingress, error) {
-	patch := client.MergeFrom(ig.DeepCopy())
-
-	ig.Spec.Rules[0].Host = ts.Spec.Ingress.Host
-	ig.Spec.IngressClassName = ptr.To[string](ts.Spec.Ingress.IngressClassName)
-	ig.Spec.Rules[0].HTTP.Paths[0].Path = ts.Spec.Ingress.Path
-	ig.Spec.Rules[0].HTTP.Paths[0].PathType = ts.Spec.Ingress.PathType
+	pathType := ts.Spec.Ingress.PathType
+	if pathType == nil {
+		pathType = ptr.To(networkingv1.PathTypePrefix)
+	}
 
 	annotations := map[string]string{}
+	if ts.Spec.Ingress.Annotations != nil {
+		maps.Copy(annotations, ts.Spec.Ingress.Annotations)
+	}
+
+	labels := map[string]string{}
+	if ts.Spec.Ingress.Labels != nil {
+		maps.Copy(labels, ts.Spec.Ingress.Labels)
+	}
+
 	var tlsSecretName string
 
 	if ts.Spec.Ingress.ClusterIssuer != nil {
@@ -368,38 +464,64 @@ func (r *TypesenseClusterReconciler) updateIngress(ctx context.Context, ig netwo
 		tlsSecretName = fmt.Sprintf("%s-reverse-proxy-%s-certificate-tls", ts.Name, *ts.Spec.Ingress.ClusterIssuer)
 	}
 
-	if ts.Spec.Ingress.Labels != nil {
-		maps.Copy(ig.Labels, ts.Spec.Ingress.Labels)
-	}
-
-	if ts.Spec.Ingress.Annotations != nil {
-		maps.Copy(ig.Annotations, ts.Spec.Ingress.Annotations)
-	}
-
 	if ts.Spec.Ingress.TLSSecretName != nil {
 		tlsSecretName = *ts.Spec.Ingress.TLSSecretName
 	}
-	ig.Spec.TLS[0].SecretName = tlsSecretName
 
-	if err := r.Patch(ctx, &ig, patch); err != nil {
+	var ingressTLS []networkingv1.IngressTLS
+	if tlsSecretName != "" {
+		ingressTLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{ts.Spec.Ingress.Host},
+			SecretName: tlsSecretName,
+		}}
+	}
+
+	desired := &networkingv1.Ingress{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: networkingv1.SchemeGroupVersion.String(),
+			Kind:       "Ingress",
+		},
+		ObjectMeta: getIngressObjectMeta(ts, &ig.Name, labels, annotations),
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To(ts.Spec.Ingress.IngressClassName),
+			TLS:              ingressTLS,
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: ts.Spec.Ingress.Host,
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     ts.Spec.Ingress.Path,
+									PathType: pathType,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: fmt.Sprintf(ClusterReverseProxyService, ts.Name),
+											Port: networkingv1.ServiceBackendPort{
+												Number: 8080,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	//nolint:staticcheck
+	if err := r.Patch(ctx, desired, client.Apply, client.ForceOwnership, client.FieldOwner("typesense-operator")); err != nil {
 		return nil, err
 	}
 
-	return &ig, nil
-}
-
-func (r *TypesenseClusterReconciler) deleteIngress(ctx context.Context, ig *networkingv1.Ingress) error {
-	err := r.Delete(ctx, ig)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return desired, nil
 }
 
 func (r *TypesenseClusterReconciler) getIngressLabels(ig *networkingv1.Ingress, ts *tsv1alpha1.TypesenseCluster, key client.ObjectKey) map[string]string {
-	var filters []string
 	defaultLabels := getIngressObjectMeta(ts, &key.Name, nil, nil).Labels
+	filters := make([]string, 0, len(defaultLabels))
 	for k := range defaultLabels {
 		filters = append(filters, k)
 	}
@@ -414,7 +536,7 @@ func (r *TypesenseClusterReconciler) getIngressAnnotations(ig *networkingv1.Ingr
 	return filtered
 }
 
-func (r *TypesenseClusterReconciler) createIngressConfigMap(ctx context.Context, key client.ObjectKey, ts *tsv1alpha1.TypesenseCluster, ig *networkingv1.Ingress) (*v1.ConfigMap, error) {
+func (r *TypesenseClusterReconciler) createIngressConfigMap(ctx context.Context, key client.ObjectKey, ts *tsv1alpha1.TypesenseCluster) (*v1.ConfigMap, error) {
 	nginxConf, err := r.getIngressNginxConf(ts)
 	if err != nil {
 		return nil, err
@@ -423,11 +545,11 @@ func (r *TypesenseClusterReconciler) createIngressConfigMap(ctx context.Context,
 	icm := &v1.ConfigMap{
 		ObjectMeta: getReverseProxyObjectMeta(ts, &key.Name, nil),
 		Data: map[string]string{
-			"nginx.conf": nginxConf,
+			nginxConfKey: nginxConf,
 		},
 	}
 
-	err = ctrl.SetControllerReference(ig, icm, r.Scheme)
+	err = ctrl.SetControllerReference(ts, icm, r.Scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -446,18 +568,25 @@ func (r *TypesenseClusterReconciler) updateIngressConfigMap(ctx context.Context,
 		return nil, err
 	}
 
-	desired := cm.DeepCopy()
-	desired.Data = map[string]string{
-		"nginx.conf": nginxConf,
+	desired := &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: getReverseProxyObjectMeta(ts, &cm.Name, nil),
+		Data: map[string]string{
+			nginxConfKey: nginxConf,
+		},
 	}
 
-	err = r.Update(ctx, desired)
+	//nolint:staticcheck
+	err = r.Patch(ctx, desired, client.Apply, client.ForceOwnership, client.FieldOwner("typesense-operator"))
 	if err != nil {
 		r.logger.Error(err, "updating ingress config map failed")
 		return nil, err
 	}
 
-	return desired, nil
+	return cm, nil
 }
 
 func (r *TypesenseClusterReconciler) shouldUpdateIngressConfigMap(cm *v1.ConfigMap, ts *tsv1alpha1.TypesenseCluster) (bool, error) {
@@ -466,7 +595,7 @@ func (r *TypesenseClusterReconciler) shouldUpdateIngressConfigMap(cm *v1.ConfigM
 		return false, err
 	}
 
-	return cm.Data["nginx.conf"] != nginxConf, nil
+	return cm.Data[nginxConfKey] != nginxConf, nil
 }
 
 func (r *TypesenseClusterReconciler) getIngressNginxConf(ts *tsv1alpha1.TypesenseCluster) (string, error) {
@@ -506,7 +635,12 @@ func (r *TypesenseClusterReconciler) getIngressNginxConf(ts *tsv1alpha1.Typesens
 		ServicePort:        strconv.Itoa(ts.Spec.ApiPort),
 	}
 
-	tmpl, err := template.New("nginxConf").Parse(confTemplate)
+	templateStr := confTemplate
+	if ts.Spec.Ingress != nil && ts.Spec.Ingress.Config != nil {
+		templateStr = *ts.Spec.Ingress.Config
+	}
+
+	tmpl, err := template.New("nginxConf").Parse(templateStr)
 	if err != nil {
 		r.logger.Error(err, "error parsing template")
 		return "", err
@@ -548,87 +682,29 @@ func (r *TypesenseClusterReconciler) getDefaultReverseProxyVolumeMounts() []v1.V
 	}
 }
 
-func (r *TypesenseClusterReconciler) createIngressDeployment(ctx context.Context, key client.ObjectKey, ts *tsv1alpha1.TypesenseCluster, ig *networkingv1.Ingress) (*appsv1.Deployment, error) {
-	volumes := r.getDefaultReverseProxyVolumes(ts.Name)
-	volumeMounts := r.getDefaultReverseProxyVolumeMounts()
-	var securityContext *v1.SecurityContext
-
-	if ts.Spec.Ingress.ReadOnlyRootFilesystem != nil {
-		volumes = append(volumes, ts.Spec.Ingress.ReadOnlyRootFilesystem.Volumes...)
-		volumeMounts = append(volumeMounts, ts.Spec.Ingress.ReadOnlyRootFilesystem.VolumeMounts...)
-
-		if ts.Spec.Ingress.ReadOnlyRootFilesystem.SecurityContext != nil {
-			securityContext = ts.Spec.Ingress.ReadOnlyRootFilesystem.SecurityContext
-		} else {
-			securityContext = &v1.SecurityContext{
-				ReadOnlyRootFilesystem: ptr.To(true),
-			}
-		}
-
+func (r *TypesenseClusterReconciler) createIngressService(ctx context.Context, key client.ObjectKey, ts *tsv1alpha1.TypesenseCluster) (*v1.Service, error) {
+	svcType := v1.ServiceTypeNodePort
+	if ts.Spec.Ingress.ServiceType != "" {
+		svcType = ts.Spec.Ingress.ServiceType
 	}
 
-	deployment := &appsv1.Deployment{
-		ObjectMeta: getReverseProxyObjectMeta(ts, &key.Name, nil),
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](3),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: getReverseProxyLabels(ts),
-			},
-			Template: v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: getReverseProxyLabels(ts),
-				},
-				Spec: v1.PodSpec{
-					ImagePullSecrets: ts.Spec.ImagePullSecrets,
-					Containers: []v1.Container{
-						{
-							Name:  fmt.Sprintf(ClusterReverseProxy, ts.Name),
-							Image: ts.Spec.Ingress.Image,
-							Ports: []v1.ContainerPort{
-								{
-									ContainerPort: 80,
-								},
-							},
-							Resources:       ts.Spec.Ingress.GetReverseProxyResources(),
-							VolumeMounts:    volumeMounts,
-							SecurityContext: securityContext,
-						},
-					},
-					Volumes: volumes,
-				},
-			},
-		},
-	}
-
-	if err := ctrl.SetControllerReference(ig, deployment, r.Scheme); err != nil {
-		return nil, err
-	}
-
-	if err := r.Create(ctx, deployment); err != nil {
-		return nil, err
-	}
-
-	return deployment, nil
-}
-
-func (r *TypesenseClusterReconciler) createIngressService(ctx context.Context, key client.ObjectKey, ts *tsv1alpha1.TypesenseCluster, ig *networkingv1.Ingress) (*v1.Service, error) {
 	service := &v1.Service{
 		ObjectMeta: getReverseProxyObjectMeta(ts, &key.Name, ts.Spec.Ingress.ServiceAnnotations),
 		Spec: v1.ServiceSpec{
-			Type:     v1.ServiceTypeNodePort,
+			Type:     svcType,
 			Selector: getReverseProxyLabels(ts),
 			Ports: []v1.ServicePort{
 				{
 					Protocol:   v1.ProtocolTCP,
-					Port:       80,
-					TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: int32(80)},
-					Name:       "http",
+					Port:       8080,
+					TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: int32(8080)},
+					Name:       protocolHttp,
 				},
 			},
 		},
 	}
 
-	err := ctrl.SetControllerReference(ig, service, r.Scheme)
+	err := ctrl.SetControllerReference(ts, service, r.Scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -641,14 +717,40 @@ func (r *TypesenseClusterReconciler) createIngressService(ctx context.Context, k
 	return service, nil
 }
 
-func (r *TypesenseClusterReconciler) updateIngressService(ctx context.Context, svc *v1.Service, ts *tsv1alpha1.TypesenseCluster) error {
-	patch := client.MergeFrom(svc.DeepCopy())
-	if svc.ObjectMeta.Annotations == nil {
-		svc.ObjectMeta.Annotations = map[string]string{}
-	}
-	svc.ObjectMeta.Annotations = ts.Spec.Ingress.ServiceAnnotations
+func (r *TypesenseClusterReconciler) updateIngressService(ctx context.Context, service *v1.Service, ts *tsv1alpha1.TypesenseCluster) error {
+	patch := client.MergeFrom(service.DeepCopy())
 
-	if err := r.Patch(ctx, svc, patch); err != nil {
+	svcType := v1.ServiceTypeNodePort
+	if ts.Spec.Ingress.ServiceType != "" {
+		svcType = ts.Spec.Ingress.ServiceType
+	}
+
+	service.Spec.Type = svcType
+	service.Spec.Ports = []v1.ServicePort{
+		{
+			Protocol:   v1.ProtocolTCP,
+			Port:       8080,
+			TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: int32(8080)},
+			Name:       protocolHttp,
+		},
+	}
+
+	annotations := map[string]string{}
+	if ts.Spec.Ingress.ServiceAnnotations != nil {
+		maps.Copy(annotations, ts.Spec.Ingress.ServiceAnnotations)
+	}
+	filters := ts.Spec.IgnoreAnnotationsFromExternalMutations
+	for k, v := range service.Annotations {
+		for _, f := range filters {
+			if strings.Contains(k, f) {
+				annotations[k] = v
+				break
+			}
+		}
+	}
+	service.Annotations = annotations
+
+	if err := r.Patch(ctx, service, patch); err != nil {
 		return err
 	}
 

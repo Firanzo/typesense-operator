@@ -17,6 +17,9 @@ func (r *TypesenseClusterReconciler) patchStatus(
 	patch := client.MergeFrom(ts.DeepCopy())
 	patcher(&ts.Status)
 
+	// Keep ObservedGeneration in sync with the current metadata.generation
+	ts.Status.ObservedGeneration = ts.Generation
+
 	err := r.Status().Patch(ctx, ts, patch)
 	if err != nil {
 		r.logger.Error(err, "unable to patch typesense cluster status")
@@ -27,25 +30,38 @@ func (r *TypesenseClusterReconciler) patchStatus(
 }
 
 func (r *TypesenseClusterReconciler) IsFeatureSupported(minimum string) (bool, string, error) {
-	info, err := r.DiscoveryClient.ServerVersion()
-	if err != nil {
-		return false, "", err
+	if r.serverVersion == "" {
+		info, err := r.DiscoveryClient.ServerVersion()
+		if err != nil {
+			return false, "", err
+		}
+		r.serverVersion = info.GitVersion
 	}
 
-	ver, err := version.ParseGeneric(info.GitVersion)
+	ver, err := version.ParseGeneric(r.serverVersion)
 	if err != nil {
-		return false, info.GitVersion, err
+		return false, r.serverVersion, err
 	}
 
 	req, err := version.ParseGeneric(fmt.Sprintf("v%s", minimum))
 	if err != nil {
-		return false, info.GitVersion, err
+		return false, r.serverVersion, err
 	}
 
-	return ver.AtLeast(req), info.GitVersion, nil
+	return ver.AtLeast(req), r.serverVersion, nil
 }
 
 func (r *TypesenseClusterReconciler) IsApiGroupDeployed(apiGroup string) (bool, error) {
+	r.apiGroupsMutex.RLock()
+	if supported, exists := r.apiGroupsCache[apiGroup]; exists {
+		r.apiGroupsMutex.RUnlock()
+		if supported {
+			return true, nil
+		}
+	} else {
+		r.apiGroupsMutex.RUnlock()
+	}
+
 	apiGroupList, err := r.DiscoveryClient.ServerGroups()
 	if err != nil {
 		return false, err
@@ -53,9 +69,21 @@ func (r *TypesenseClusterReconciler) IsApiGroupDeployed(apiGroup string) (bool, 
 
 	for _, ag := range apiGroupList.Groups {
 		if ag.Name == apiGroup {
+			r.apiGroupsMutex.Lock()
+			if r.apiGroupsCache == nil {
+				r.apiGroupsCache = make(map[string]bool)
+			}
+			r.apiGroupsCache[apiGroup] = true
+			r.apiGroupsMutex.Unlock()
 			return true, nil
 		}
 	}
 
+	r.apiGroupsMutex.Lock()
+	if r.apiGroupsCache == nil {
+		r.apiGroupsCache = make(map[string]bool)
+	}
+	r.apiGroupsCache[apiGroup] = false
+	r.apiGroupsMutex.Unlock()
 	return false, nil
 }

@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -32,7 +33,7 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	update = false
 	scaleOnly = false
 
-	if sts == nil || ts == nil {
+	if sts == nil || ts == nil || desired == nil {
 		return false, false, nil
 	}
 
@@ -42,8 +43,8 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	}
 
 	// SpecReplicasChanged
-	if *sts.Spec.Replicas != ts.Spec.Replicas &&
-		(condition.Reason != string(ConditionReasonQuorumDowngraded) || condition.Reason != string(ConditionReasonQuorumQueuedWrites)) {
+	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas &&
+		!isQuorumRecoveryState(condition.Reason) {
 		triggers = append(triggers, SpecReplicasChanged)
 		update = false
 		scaleOnly = true
@@ -56,7 +57,7 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	}
 
 	mutatedAnnotations := ts.Spec.IgnoreAnnotationsFromExternalMutations
-	stsAnnotations := filterMap(sts.ObjectMeta.Annotations, append([]string{rancherDomainAnnotationKey}, mutatedAnnotations...)...)
+	stsAnnotations := filterMap(sts.Annotations, append([]string{rancherDomainAnnotationKey}, mutatedAnnotations...)...)
 	podAnnotations := filterMap(sts.Spec.Template.Annotations, append([]string{restartPodsAnnotationKey, rancherDomainAnnotationKey}, mutatedAnnotations...)...)
 
 	// PodAnnotationsChanged
@@ -66,16 +67,16 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	}
 
 	// StatefulSetAnnotationsChanged
-	if !apiequality.Semantic.DeepEqual(stsAnnotations, desired.ObjectMeta.Annotations) {
+	if !apiequality.Semantic.DeepEqual(stsAnnotations, desired.Annotations) {
 		triggers = append(triggers, StatefulSetAnnotationsChanged)
 		update = true
 	}
 
-	//// SpecResourcesChanged
-	//if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[0].Resources, ts.Spec.GetResources()) {
-	//	triggers = append(triggers, SpecResourcesChanged)
-	//	update = true
-	//}
+	// SpecResourcesChanged
+	// if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[0].Resources, ts.Spec.GetResources()) {
+	// 	triggers = append(triggers, SpecResourcesChanged)
+	// 	update = true
+	// }
 
 	// PodSecurityContextChanged
 	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.SecurityContext, ts.Spec.GetPodSecurityContext()) {
@@ -87,6 +88,7 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	if len(sts.Spec.Template.Spec.Containers) < 3 {
 		triggers = append(triggers, InvalidContainerCount)
 		update = true
+		return update, scaleOnly, triggers
 	}
 
 	// ContainerSecurityContextChanged
@@ -120,38 +122,13 @@ func (r *TypesenseClusterReconciler) shouldEmergencyUpdateStatefulSet(sts *appsv
 		return false
 	}
 
-	if *sts.Spec.Replicas != ts.Spec.Replicas &&
-		(condition.Reason != string(ConditionReasonQuorumDowngraded) || condition.Reason != string(ConditionReasonQuorumQueuedWrites)) {
-		return true
-	}
-
-	// ResourcesChanged
-	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[0].Resources, ts.Spec.GetResources()) {
-		return true
-	}
-
-	// PodSecurityContextChanged
-	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.SecurityContext, ts.Spec.GetPodSecurityContext()) {
+	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas &&
+		!isQuorumRecoveryState(condition.Reason) {
 		return true
 	}
 
 	// InvalidContainerCount
 	if len(sts.Spec.Template.Spec.Containers) < 3 {
-		return true
-	}
-
-	// ContainerSecurityContextChanged
-	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[0].SecurityContext, ts.Spec.GetTypesenseSecurityContext()) {
-		return true
-	}
-
-	// ContainerSecurityContextChanged
-	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[1].SecurityContext, ts.Spec.GetMetricsSecurityContext()) {
-		return true
-	}
-
-	// ContainerSecurityContextChanged
-	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Containers[2].SecurityContext, ts.Spec.GetHealthcheckSecurityContext()) {
 		return true
 	}
 
@@ -161,8 +138,10 @@ func (r *TypesenseClusterReconciler) shouldEmergencyUpdateStatefulSet(sts *appsv
 func (r *TypesenseClusterReconciler) buildStatefulSetHash(ctx context.Context, sts *appsv1.StatefulSet, ts *tsv1alpha1.TypesenseCluster) (*string, error) {
 	stsTemplate := sts.Spec.Template.DeepCopy()
 	if stsTemplate.Annotations == nil {
-		delete(stsTemplate.Annotations, hashAnnotationKey)
+		stsTemplate.Annotations = map[string]string{}
 	}
+
+	delete(stsTemplate.Annotations, hashAnnotationKey)
 	podTemplate := stsTemplate.Spec.DeepCopy()
 
 	var additionalConfData map[string]map[string]string
@@ -177,6 +156,20 @@ func (r *TypesenseClusterReconciler) buildStatefulSetHash(ctx context.Context, s
 				}
 
 				additionalConfData[cm.Name] = cm.Data
+			}
+			if ac.SecretRef != nil {
+				secretObjectKey := client.ObjectKey{Namespace: ts.Namespace, Name: ac.SecretRef.Name}
+				var secret = &corev1.Secret{}
+				if err := r.Get(ctx, secretObjectKey, secret); err != nil {
+					return nil, err
+				}
+
+				// Convert []byte to string for the hash map
+				strData := make(map[string]string, len(secret.Data))
+				for k, v := range secret.Data {
+					strData[k] = string(v)
+				}
+				additionalConfData[secret.Name] = strData
 			}
 		}
 	}

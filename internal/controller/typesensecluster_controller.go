@@ -18,12 +18,19 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/pkg/errors"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -31,9 +38,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -51,6 +60,11 @@ type TypesenseClusterReconciler struct {
 	ClientSet       *kubernetes.Clientset
 	Configuration   *rest.Config
 	InCluster       bool
+	HttpClient      *http.Client
+
+	apiGroupsCache map[string]bool
+	apiGroupsMutex sync.RWMutex
+	serverVersion  string
 }
 
 type TypesenseClusterReconciliationPhase struct {
@@ -73,8 +87,8 @@ var (
 			return !e.DeleteStateUnknown
 		},
 	})
-	// kubelets sync configmaps by default every minute so let's wait for 2 minutes
-	configMapRequeuePeriod = 2 * time.Minute
+	// kubelets sync configmaps by default every minute, but forcePodsConfigMapUpdate triggers an immediate sync
+	configMapRequeuePeriod = 15 * time.Second
 	reconcileRequeuePeriod = 60 * time.Second
 )
 
@@ -85,25 +99,41 @@ const (
 	Reconciling   Action = "reconciling"
 )
 
-// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete;update;patch
-// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
+const (
+	protocolHttp         = "http"
+	containerTypesense   = "typesense"
+	envTypesenseApiKey   = "TYPESENSE_API_KEY"
+	envTypesenseProtocol = "TYPESENSE_PROTOCOL"
+	envTypesenseConfig   = "CONFIG"
+	envTypesenseHost     = "TYPESENSE_HOST"
+	envTypesensePort     = "TYPESENSE_PORT"
+	portHealthcheck      = "healthcheck"
+	volumeNodeslist      = "nodeslist"
+	volumeData           = "data"
+)
+
+// --- Core Kubernetes API ---
+// +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;pods;secrets;services,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;patch;update
+// --- Workloads & Batch ---
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=create;delete;get;list;patch;update;watch
+// --- Networking & Gateway API ---
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=referencegrants,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes;referencegrants,verbs=create;delete;get;list;patch;update;watch
+// --- Monitoring ---
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors;servicemonitors,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/finalizers,verbs=update
+// --- Webhook Management ---
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch;update;patch
+// --- Typesense Custom Resources ---
+// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=ts.opentelekomcloud.com,resources=typesenseclusters/status,verbs=get;patch;update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -114,12 +144,38 @@ const (
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.4/pkg/reconcile
+//
+//nolint:gocyclo // Reconcile sequentially coordinates multiple child controllers
 func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	r.logger = log.Log.WithValues("namespace", req.Namespace, "cluster", req.Name)
 
 	var ts tsv1alpha1.TypesenseCluster
 	if err := r.Get(ctx, req.NamespacedName, &ts); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	const typesenseClusterFinalizer = "ts.opentelekomcloud.com/finalizer"
+
+	if ts.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&ts, typesenseClusterFinalizer) {
+			controllerutil.AddFinalizer(&ts, typesenseClusterFinalizer)
+			if err := r.Update(ctx, &ts); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else {
+		if controllerutil.ContainsFinalizer(&ts, typesenseClusterFinalizer) {
+			if err := r.deleteOrphanedReferenceGrants(ctx, &ts); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&ts, typesenseClusterFinalizer)
+			if err := r.Update(ctx, &ts); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
 	}
 
 	r.logger.Info("reconciling cluster")
@@ -129,32 +185,41 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	if len(ts.Name) > 24 {
+		err := fmt.Errorf("cluster name '%s' exceeds the maximum allowed length of 24 characters (got %d characters)", ts.Name, len(ts.Name))
+		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonInvalidClusterName, err)
+		if cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		return ctrl.Result{}, err
+	}
+
 	// Update strategy: Admin Secret is Immutable, will not be updated on any future change
-	secret, err := r.ReconcileSecret(ctx, ts)
+	secret, err := r.ReconcileSecret(ctx, &ts)
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonSecretNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
 
 	// Update strategy: Update the existing object, if changes are identified in the desired.Data["nodes"]
-	configMapUpdated, err := r.ReconcileConfigMap(ctx, ts)
+	configMapUpdated, err := r.ReconcileConfigMap(ctx, &ts)
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonConfigMapNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
 
 	// Update strategy: Update the existing objects, if changes are identified in api and peering ports
-	err = r.ReconcileServices(ctx, ts)
+	err = r.ReconcileServices(ctx, &ts)
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonServicesNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
@@ -164,7 +229,7 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonIngressNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
@@ -174,27 +239,27 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonHttpRouteNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
 
 	// Update strategy: Drop the existing objects and recreate them, if changes are identified
-	err = r.ReconcileScraper(ctx, ts)
+	err = r.ReconcileScraper(ctx, &ts)
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonScrapersNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
 
 	// Update strategy: Update the Deployment if image changed. Drop the existing ServiceMonitor and recreate it, if changes are identified
-	err = r.ReconcilePodMonitor(ctx, ts)
+	err = r.ReconcilePodMonitor(ctx, &ts)
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonMetricsExporterNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
@@ -204,12 +269,21 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if err != nil {
 		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonStatefulSetNotReady, err)
 		if cerr != nil {
-			err = errors.Wrap(err, cerr.Error())
+			err = errors.Join(err, cerr)
 		}
 		return ctrl.Result{}, err
 	}
 
-	terminationGracePeriodSeconds := *sts.Spec.Template.Spec.TerminationGracePeriodSeconds
+	err = r.ReconcilePodDisruptionBudget(ctx, &ts, sts)
+	if err != nil {
+		cerr := r.setConditionNotReady(ctx, &ts, ConditionReasonPodDisruptionBudgetNotReady, err)
+		if cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		return ctrl.Result{}, err
+	}
+
+	terminationGracePeriodSeconds := ptr.Deref(sts.Spec.Template.Spec.TerminationGracePeriodSeconds, 5)
 	requeueAfter := reconcileRequeuePeriod + (time.Duration(terminationGracePeriodSeconds) * time.Second)
 
 	cond := ConditionReasonQuorumStateUnknown
@@ -246,7 +320,7 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if cerr != nil {
 			return ctrl.Result{}, cerr
 		}
-		r.Recorder.Eventf(&ts, "Warning", string(cond), toTitle(err.Error()))
+		r.Recorder.Event(&ts, "Warning", string(cond), toTitle(err.Error()))
 	}
 
 	condition, _, err := r.ReconcileQuorum(ctx, &ts, secret, client.ObjectKeyFromObject(sts))
@@ -266,23 +340,48 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 
 		erram := errors.New(eram)
+
+		shouldEmit := true
+		if len(ts.Status.Conditions) > 0 && ts.Status.Conditions[0].Reason == string(condition) {
+			shouldEmit = false
+		}
+
 		cerr := r.setConditionNotReady(ctx, &ts, string(condition), erram)
 		if cerr != nil {
 			return ctrl.Result{}, cerr
 		}
-		r.Recorder.Eventf(&ts, "Warning", string(condition), toTitle(erram.Error()))
+		if shouldEmit {
+			r.Recorder.Event(&ts, "Warning", string(condition), toTitle(erram.Error()))
+		}
 
 	} else {
 		if condition != ConditionReasonQuorumReady {
+			eventType := "Warning"
 			if err == nil {
-				err = errors.New("quorum is not ready")
+				switch condition {
+				case ConditionReasonUpgrading:
+					err = errors.New("cluster is performing a rolling update")
+					eventType = "Normal"
+				case ConditionReasonDegraded:
+					err = errors.New("quorum is intact, but cluster is degraded (missing nodes)")
+				default:
+					err = errors.New("quorum is not ready")
+				}
 			}
+
+			shouldEmit := true
+			if len(ts.Status.Conditions) > 0 && ts.Status.Conditions[0].Reason == string(condition) {
+				shouldEmit = false
+			}
+
 			cerr := r.setConditionNotReady(ctx, &ts, string(condition), err)
 			if cerr != nil {
 				return ctrl.Result{}, cerr
 			}
 
-			r.Recorder.Eventf(&ts, "Warning", string(condition), toTitle(err.Error()))
+			if shouldEmit {
+				r.Recorder.Event(&ts, eventType, string(condition), toTitle(err.Error()))
+			}
 		} else {
 			report := ts.Status.Conditions[0].Status != metav1.ConditionTrue
 
@@ -292,12 +391,16 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			}
 
 			if report {
-				r.Recorder.Eventf(&ts, "Normal", string(condition), toTitle("quorum is ready"))
+				r.Recorder.Event(&ts, "Normal", string(condition), toTitle("quorum is ready"))
 			}
 		}
 	}
 
 	cond = condition
+
+	if cond == ConditionReasonUpgrading || cond == ConditionReasonDegraded || strings.Contains(string(cond), "NotReady") {
+		requeueAfter = 15 * time.Second
+	}
 
 	r.logger.Info(fmt.Sprintf("%s cluster completed", string(action)), "condition", cond, "requeueAfter", requeueAfter)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -307,6 +410,14 @@ func (r *TypesenseClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 func (r *TypesenseClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tsv1alpha1.TypesenseCluster{}, eventFilters).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Secret{}).
+		Owns(&networkingv1.Ingress{}).
+		Owns(&batchv1.CronJob{}).
 		Named("typesense-kubernetes-operator").
 		Complete(r)
 }

@@ -15,6 +15,7 @@ const (
 	ConditionTypeReady = "Ready"
 
 	ConditionReasonReconciliationInProgress                              = "ReconciliationInProgress"
+	ConditionReasonInvalidClusterName                                    = "InvalidClusterName"
 	ConditionReasonSecretNotReady                                        = "SecretNotReady"
 	ConditionReasonConfigMapNotReady                                     = "ConfigMapNotReady"
 	ConditionReasonServicesNotReady                                      = "ServicesNotReady"
@@ -22,6 +23,9 @@ const (
 	ConditionReasonHttpRouteNotReady                                     = "HttpRouteNotReady"
 	ConditionReasonScrapersNotReady                                      = "ScrapersNotReady"
 	ConditionReasonMetricsExporterNotReady                               = "MetricsExporterNotReady"
+	ConditionReasonPodDisruptionBudgetNotReady                           = "PodDisruptionBudgetNotReady"
+	ConditionReasonUpgrading                             ConditionQuorum = "Upgrading"
+	ConditionReasonDegraded                              ConditionQuorum = "Degraded"
 	ConditionReasonQuorumStateUnknown                    ConditionQuorum = "QuorumStateUnknown"
 	ConditionReasonQuorumReady                           ConditionQuorum = "QuorumReady"
 	ConditionReasonQuorumNotReady                        ConditionQuorum = "QuorumNotReady"
@@ -72,10 +76,23 @@ func (r *TypesenseClusterReconciler) setConditionReady(ctx context.Context, ts *
 }
 
 func (r *TypesenseClusterReconciler) getConditionReady(ts *tsv1alpha1.TypesenseCluster) *metav1.Condition {
+	if len(ts.Status.Conditions) == 0 {
+		return nil
+	}
+
 	condition := ts.Status.Conditions[0]
 	if condition.Type != ConditionTypeReady {
 		return nil
 	}
 
 	return &condition
+}
+
+func isQuorumRecoveryState(reason string) bool {
+	return reason == string(ConditionReasonQuorumDowngraded) ||
+		reason == string(ConditionReasonQuorumUpgraded) ||
+		reason == string(ConditionReasonQuorumQueuedWrites) ||
+		reason == string(ConditionReasonQuorumNotReady) ||
+		reason == string(ConditionReasonQuorumNotReadyWaitATerm) ||
+		reason == ConditionReasonStatefulSetNotReady
 }

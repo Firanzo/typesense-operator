@@ -19,16 +19,9 @@ const (
 	ClusterHttpRoute               = "%s-%s"
 	ClusterHttpRouteReferenceGrant = "%s-%s-reference-grant"
 
-	//TODO Remove them future version 0.2.15
-
-	ClusterPrometheusExporterAppLabel       = "%s-prometheus-exporter"
-	ClusterPrometheusExporterDeployment     = "%s-prometheus-exporter"
-	ClusterPrometheusExporterService        = "%s-prometheus-exporter-svc"
-	ClusterPrometheusExporterServiceMonitor = "%s-prometheus-exporter-servicemonitor"
-
 	ClusterMetricsPodMonitorAppLabel = "%s-sts"
 	ClusterMetricsPodMonitor         = "%s-podmonitor"
 
-	ClusterScraperCronJob          = "%s-scraper"
-	ClusterScraperCronJobContainer = "%s-docsearch-scraper"
+	ClusterScraperCronJob          = "%s-scraper-%s"
+	ClusterScraperCronJobContainer = "%s-%s-docsearch-scraper"
 )

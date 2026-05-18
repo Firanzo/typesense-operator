@@ -22,6 +22,7 @@ const (
 	HealthyReadLagDefaultValue   = 1000
 )
 
+//nolint:gocyclo // ReconcileQuorum coordinates multiple steps safely
 func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *tsv1alpha1.TypesenseCluster, secret *v1.Secret, stsObjectKey client.ObjectKey) (ConditionQuorum, int, error) {
 	r.logger.Info("reconciling quorum health")
 
@@ -51,10 +52,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 	}
 
 	nodesStatus := make(map[string]NodeStatus)
-	httpClient, err := r.getHttpClient(ts)
-	if err != nil {
-		return ConditionReasonQuorumNotReady, 0, err
-	}
+	httpClient := r.getHttpClient()
 
 	queuedWrites := 0
 	healthyWriteLagThreshold := r.getHealthyWriteLagThreshold(ctx, ts)
@@ -67,12 +65,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 
 	nodeEndpoints := make([]NodeEndpoint, 0, len(quorum.Nodes))
 	for _, key := range nodeKeys {
-		ne := NodeEndpoint{
-			PodName: key,
-			IP:      quorum.Nodes[key],
-		}
-
-		nodeEndpoints = append(nodeEndpoints, ne)
+		nodeEndpoints = append(nodeEndpoints, quorum.Nodes[key])
 	}
 
 	logs := make(map[string]string, len(quorum.Nodes))
@@ -85,7 +78,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 		logs[ne.PodName] = l
 	}
 
-	//quorum.Nodes are coming straight from the PodList of Statefulset
+	// quorum.Nodes are coming straight from the PodList of Statefulset
 	for _, ne := range nodeEndpoints {
 		status, err := r.getNodeStatus(ctx, httpClient, ne, ts, secret, logs[ne.PodName])
 		if err != nil {
@@ -106,7 +99,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 			ne.IP,
 			"queued_writes",
 			status.QueuedWrites,
-			"commited_index",
+			"committed_index",
 			status.CommittedIndex,
 		)
 		nodesStatus[ne.PodName] = status
@@ -143,7 +136,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 		nodesHealth[key], _ = strconv.ParseBool(string(condition.Status))
 
 		podPrefix := fmt.Sprintf(ClusterStatefulSet, ts.Name)
-		podIndex := strings.Replace(key, fmt.Sprintf("%s-", podPrefix), "", -1)
+		podIndex := strings.ReplaceAll(key, fmt.Sprintf("%s-", podPrefix), "")
 		podName := fmt.Sprintf("%s-%s", podPrefix, podIndex)
 		podObjectKey := client.ObjectKey{Namespace: ts.Namespace, Name: podName}
 
@@ -211,7 +204,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 		}
 	}
 
-	if clusterStatus == ClusterStatusOK && *sts.Spec.Replicas < ts.Spec.Replicas {
+	if clusterStatus == ClusterStatusOK && ptr.Deref(sts.Spec.Replicas, 1) < ts.Spec.Replicas {
 		if queuedWrites > 0 {
 			return ConditionReasonQuorumQueuedWrites, 0, nil
 		}
@@ -221,6 +214,18 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 
 	if healthyNodes < minRequiredNodes {
 		return ConditionReasonQuorumNotReady, 0, nil
+	}
+
+	if sts.Status.UpdateRevision != sts.Status.CurrentRevision {
+		return ConditionReasonUpgrading, 0, nil
+	}
+
+	if sts.Status.Replicas < *sts.Spec.Replicas {
+		return ConditionReasonUpgrading, 0, nil
+	}
+
+	if healthyNodes < int(ts.Spec.Replicas) {
+		return ConditionReasonDegraded, 0, nil
 	}
 
 	return ConditionReasonQuorumReady, 0, nil
@@ -238,7 +243,7 @@ func (r *TypesenseClusterReconciler) downgradeQuorum(
 	stsObjectKey client.ObjectKey,
 	healthyNodes, minRequiredNodes int32,
 ) (ConditionQuorum, int, error) {
-	//r.logger.Info("downgrading quorum")
+	// r.logger.Info("downgrading quorum")
 	r.logger.V(debugLevel).Info("scaling statefulset", "sts", stsObjectKey.Name, "triggers", QuorumDowngraded)
 
 	sts, err := r.GetFreshStatefulSet(ctx, stsObjectKey)
@@ -262,7 +267,7 @@ func (r *TypesenseClusterReconciler) downgradeQuorum(
 		}
 	}
 
-	_, size, updated, err := r.updateConfigMap(ctx, ts, cm, ptr.To[int32](desiredReplicas), true)
+	size, updated, err := r.updateConfigMap(ctx, ts, cm, ptr.To[int32](desiredReplicas), true)
 	if err != nil {
 		return ConditionReasonQuorumNotReady, 0, err
 	}
@@ -280,7 +285,7 @@ func (r *TypesenseClusterReconciler) upgradeQuorum(
 	cm *v1.ConfigMap,
 	stsObjectKey client.ObjectKey,
 ) (ConditionQuorum, int, error) {
-	//r.logger.Info("upgrading quorum", "incremental", ts.Spec.IncrementalQuorumRecovery)
+	// r.logger.Info("upgrading quorum", "incremental", ts.Spec.IncrementalQuorumRecovery)
 	r.logger.V(debugLevel).Info("scaling statefulset", "sts", stsObjectKey.Name, "triggers", QuorumUpgraded, "incremental", ts.Spec.IncrementalQuorumRecovery)
 
 	sts, err := r.GetFreshStatefulSet(ctx, stsObjectKey)
@@ -289,7 +294,8 @@ func (r *TypesenseClusterReconciler) upgradeQuorum(
 	}
 	size := ts.Spec.Replicas
 	if ts.Spec.IncrementalQuorumRecovery {
-		size = sts.Status.Replicas + 1
+		currentSize := ptr.Deref(sts.Spec.Replicas, 1)
+		size = currentSize + 1
 	}
 
 	err = r.ScaleStatefulSet(ctx, stsObjectKey, size)
@@ -297,7 +303,7 @@ func (r *TypesenseClusterReconciler) upgradeQuorum(
 		return ConditionReasonQuorumNotReady, 0, err
 	}
 
-	_, _, updated, err := r.updateConfigMap(ctx, ts, cm, &size, true)
+	_, updated, err := r.updateConfigMap(ctx, ts, cm, &size, true)
 	if err != nil {
 		return ConditionReasonQuorumNotReady, 0, err
 	}
@@ -337,10 +343,10 @@ func (r *TypesenseClusterReconciler) calculatePodReadinessGate(ctx context.Conte
 
 				err := fmt.Errorf("health check reported a blocking node error on %s: %s", r.getShortName(node.PodName), string(*health.ResourceError))
 				r.logger.Error(err, "quorum cannot be recovered automatically")
+			} else {
+				conditionReason = nodeNotHealthy
+				conditionStatus = v1.ConditionFalse
 			}
-
-			conditionReason = nodeNotHealthy
-			conditionStatus = v1.ConditionFalse
 		}
 	}
 
@@ -388,6 +394,6 @@ func (r *TypesenseClusterReconciler) updatePodReadinessGate(ctx context.Context,
 		return err
 	}
 
-	//r.logger.V(debugLevel).Info("updating pod readiness gate condition", "pod", pod.Name, "condition", condition.Type, "conditionStatus", condition.Status)
+	// r.logger.V(debugLevel).Info("updating pod readiness gate condition", "pod", pod.Name, "condition", condition.Type, "conditionStatus", condition.Status)
 	return nil
 }

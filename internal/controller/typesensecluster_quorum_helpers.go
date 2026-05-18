@@ -18,19 +18,25 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"k8s.io/client-go/rest"
 )
 
 func (r *TypesenseClusterReconciler) getNodeStatus(ctx context.Context, httpClient *http.Client, node NodeEndpoint, ts *tsv1alpha1.TypesenseCluster, secret *v1.Secret, logs string) (NodeStatus, error) {
-	u, err := r.buildUrl(node, ts, ts.Spec.ApiPort, "/status")
+	u, err := r.buildUrl(node, ts, node.ApiPort, "/status")
 	if err != nil {
 		return NodeStatus{State: UnreachableState}, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(ts.Spec.HealthProbeTimeoutInMilliseconds)*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodGet, u, nil)
 	if err != nil {
 		r.logger.Error(err, "creating request failed")
+		return NodeStatus{State: ErrorState}, nil
+	}
+
+	if secret == nil || secret.Data == nil || len(secret.Data[ClusterAdminApiKeySecretKeyName]) == 0 {
+		r.logger.Error(fmt.Errorf("api key missing"), "secret is missing the required data key", "ip", node.IP.String())
 		return NodeStatus{State: ErrorState}, nil
 	}
 
@@ -42,10 +48,11 @@ func (r *TypesenseClusterReconciler) getNodeStatus(ctx context.Context, httpClie
 		r.logger.Error(err, "request failed")
 		return NodeStatus{State: UnreachableState}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		r.logger.Error(err, "error executing node status request", "httpStatusCode", resp.StatusCode, "ip", node.IP.String())
+		errStatus := fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		r.logger.Error(errStatus, "error executing node status request", "httpStatusCode", resp.StatusCode, "ip", node.IP.String())
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -112,12 +119,15 @@ func (r *TypesenseClusterReconciler) getClusterStatus(nodesStatus map[string]Nod
 }
 
 func (r *TypesenseClusterReconciler) getNodeHealth(ctx context.Context, httpClient *http.Client, node NodeEndpoint, ts *tsv1alpha1.TypesenseCluster, logs string) (NodeHealth, error) {
-	u, err := r.buildUrl(node, ts, ts.Spec.ApiPort, "/health")
+	u, err := r.buildUrl(node, ts, node.ApiPort, "/health")
 	if err != nil {
 		return NodeHealth{Ok: false}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(ts.Spec.HealthProbeTimeoutInMilliseconds)*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodGet, u, nil)
 	if err != nil {
 		r.logger.Error(err, "creating request failed")
 		return NodeHealth{Ok: false}, nil
@@ -128,7 +138,7 @@ func (r *TypesenseClusterReconciler) getNodeHealth(ctx context.Context, httpClie
 		r.logger.Error(err, "request failed")
 		return NodeHealth{Ok: false}, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -166,7 +176,12 @@ func (r *TypesenseClusterReconciler) getQuorum(ctx context.Context, ts *tsv1alph
 	}
 	nodes := strings.Split(rawNodes, ",")
 	availableNodes := len(nodes)
-	minRequiredNodes := getMinimumRequiredNodes(int(sts.Status.Replicas))
+
+	targetReplicas := int(ts.Spec.Replicas)
+	if sts != nil && sts.Spec.Replicas != nil {
+		targetReplicas = int(*sts.Spec.Replicas)
+	}
+	minRequiredNodes := getMinimumRequiredNodes(targetReplicas)
 
 	var pods v1.PodList
 	labelSelector := labels.SelectorFromSet(sts.Spec.Selector.MatchLabels)
@@ -178,18 +193,38 @@ func (r *TypesenseClusterReconciler) getQuorum(ctx context.Context, ts *tsv1alph
 		return nil, err
 	}
 
-	qn := make(map[string]net.IP)
+	qn := make(map[string]NodeEndpoint)
 
 	for _, pod := range pods.Items {
 		if pod.Status.PodIP != "" {
+			actualApiPort := ts.Spec.ApiPort
+			for _, c := range pod.Spec.Containers {
+				if c.Name == containerTypesense {
+					for _, p := range c.Ports {
+						if p.Name == protocolHttp {
+							actualApiPort = int(p.ContainerPort)
+							break
+						}
+					}
+					break
+				}
+			}
+
 			raftEndpoint := fmt.Sprintf("%s:%d:%d", pod.Status.PodIP, ts.Spec.PeeringPort, ts.Spec.ApiPort)
-			if _, contains := contains(nodes, raftEndpoint); contains {
-				qn[pod.Name] = net.ParseIP(pod.Status.PodIP)
+			dnsEndpoint := fmt.Sprintf("%s.%s:%d:%d", pod.Name, fmt.Sprintf(ClusterHeadlessService, ts.Name), ts.Spec.PeeringPort, ts.Spec.ApiPort)
+			oldRaftEndpoint := fmt.Sprintf("%s:%d:%d", pod.Status.PodIP, ts.Spec.PeeringPort, actualApiPort)
+			oldDnsEndpoint := fmt.Sprintf("%s.%s:%d:%d", pod.Name, fmt.Sprintf(ClusterHeadlessService, ts.Name), ts.Spec.PeeringPort, actualApiPort)
+			if contains(nodes, raftEndpoint) || contains(nodes, dnsEndpoint) || contains(nodes, oldRaftEndpoint) || contains(nodes, oldDnsEndpoint) {
+				qn[pod.Name] = NodeEndpoint{
+					PodName: pod.Name,
+					IP:      net.ParseIP(pod.Status.PodIP),
+					ApiPort: actualApiPort,
+				}
 			}
 		}
 	}
 
-	return &Quorum{minRequiredNodes, int(availableNodes), qn, cm}, nil
+	return &Quorum{minRequiredNodes, availableNodes, qn, cm}, nil
 }
 
 func getMinimumRequiredNodes(availableNodes int) int {
@@ -210,6 +245,10 @@ func (r *TypesenseClusterReconciler) getHealthyWriteLagThreshold(ctx context.Con
 		return HealthyWriteLagDefaultValue
 	}
 
+	if cm.Data == nil {
+		return HealthyWriteLagDefaultValue
+	}
+
 	healthyWriteLagValue := cm.Data[HealthyWriteLagKey]
 	if healthyWriteLagValue == "" {
 		return HealthyWriteLagDefaultValue
@@ -224,40 +263,12 @@ func (r *TypesenseClusterReconciler) getHealthyWriteLagThreshold(ctx context.Con
 	return healthyWriteLag
 }
 
-func (r *TypesenseClusterReconciler) getHealthyReadLagThreshold(ctx context.Context, ts *tsv1alpha1.TypesenseCluster) int {
-	if ts.Spec.AdditionalServerConfiguration == nil {
-		return HealthyReadLagDefaultValue
-	}
-
-	configMapName := ts.Spec.AdditionalServerConfiguration.Name
-	configMapObjectKey := client.ObjectKey{Namespace: ts.Namespace, Name: configMapName}
-
-	var cm = &v1.ConfigMap{}
-	if err := r.Get(ctx, configMapObjectKey, cm); err != nil {
-		r.logger.Error(err, "unable to additional server configuration config map", "configMap", configMapName)
-		return HealthyReadLagDefaultValue
-	}
-
-	healthyReadLagValue := cm.Data[HealthyReadLagKey]
-	if healthyReadLagValue == "" {
-		return HealthyReadLagDefaultValue
-	}
-
-	healthyReadLag, err := strconv.Atoi(healthyReadLagValue)
-	if err != nil {
-		r.logger.Error(err, "unable to parse server configuration value", "configMap", configMapName, "key", HealthyReadLagKey)
-		return HealthyReadLagDefaultValue
-	}
-
-	return healthyReadLag
-}
-
 func (r *TypesenseClusterReconciler) getHealthyLagThresholds(ctx context.Context, ts *tsv1alpha1.TypesenseCluster) (read int, write int) {
 	read = HealthyReadLagDefaultValue
 	write = HealthyWriteLagDefaultValue
 
 	if ts.Spec.AdditionalServerConfiguration == nil {
-		return
+		return read, write
 	}
 
 	configMapName := ts.Spec.AdditionalServerConfiguration.Name
@@ -266,7 +277,11 @@ func (r *TypesenseClusterReconciler) getHealthyLagThresholds(ctx context.Context
 	var cm = &v1.ConfigMap{}
 	if err := r.Get(ctx, configMapObjectKey, cm); err != nil {
 		r.logger.Error(err, "unable to additional server configuration config map", "configMap", configMapName)
-		return
+		return read, write
+	}
+
+	if cm.Data == nil {
+		return read, write
 	}
 
 	healthyReadLagValue := cm.Data[HealthyReadLagKey]
@@ -282,37 +297,26 @@ func (r *TypesenseClusterReconciler) getHealthyLagThresholds(ctx context.Context
 	healthyReadLag, err := strconv.Atoi(healthyReadLagValue)
 	if err != nil {
 		r.logger.Error(err, "unable to parse server configuration value", "configMap", configMapName, "key", HealthyReadLagKey)
+	} else {
+		read = healthyReadLag
 	}
 
 	healthyWriteLag, err := strconv.Atoi(healthyWriteLagValue)
 	if err != nil {
 		r.logger.Error(err, "unable to parse server configuration value", "configMap", configMapName, "key", HealthyWriteLagKey)
+	} else {
+		write = healthyWriteLag
 	}
 
-	read = healthyReadLag
-	write = healthyWriteLag
-
-	return
+	return read, write
 }
 
-func (r *TypesenseClusterReconciler) getHttpClient(ts *tsv1alpha1.TypesenseCluster) (*http.Client, error) {
+func (r *TypesenseClusterReconciler) getHttpClient() *http.Client {
 	if r.InCluster {
-		return &http.Client{
-			Timeout: time.Duration(ts.Spec.HealthProbeTimeoutInMilliseconds) * time.Millisecond,
-		}, nil
+		return http.DefaultClient
 	}
 
-	restConfig := rest.CopyConfig(r.Configuration)
-	httpClient, err := rest.HTTPClientFor(restConfig)
-	if err != nil {
-		r.logger.Error(err, "failed to build kubernetes http client: %v")
-		return nil, err
-	}
-
-	httpClient.Timeout = time.Duration(ts.Spec.HealthProbeTimeoutInMilliseconds) * time.Millisecond
-	r.logger.V(debugLevel).Info("fallback to kube-proxy for http calls")
-
-	return httpClient, nil
+	return r.HttpClient
 }
 
 func (r *TypesenseClusterReconciler) buildUrl(node NodeEndpoint, ts *tsv1alpha1.TypesenseCluster, port int, path string) (string, error) {
@@ -334,13 +338,16 @@ func (r *TypesenseClusterReconciler) buildUrl(node NodeEndpoint, ts *tsv1alpha1.
 
 func (r *TypesenseClusterReconciler) getPodLogs(ctx context.Context, node NodeEndpoint, namespace string) (string, error) {
 	opts := &v1.PodLogOptions{
-		Container: "typesense",
+		Container: containerTypesense,
 		TailLines: ptr.To[int64](50),
-		//SinceSeconds: ptr.To[int64](120),
+		// SinceSeconds: ptr.To[int64](120),
 	}
 
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	req := r.ClientSet.CoreV1().Pods(namespace).GetLogs(node.PodName, opts)
-	raw, err := req.DoRaw(ctx)
+	raw, err := req.DoRaw(timeoutCtx)
 	if err != nil {
 		r.logger.Error(err, "failed to get pod logs", "pod", node.PodName, "ip", node.IP)
 		return "", err

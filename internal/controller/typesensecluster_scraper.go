@@ -8,6 +8,7 @@ import (
 	tsv1alpha1 "github.com/akyriako/typesense-operator/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,10 +17,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts tsv1alpha1.TypesenseCluster) (err error) {
+func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts *tsv1alpha1.TypesenseCluster) (err error) {
 	r.logger.V(debugLevel).Info("reconciling scrapers")
 
-	labelSelector := getLabels(&ts)
+	labelSelector := getLabels(ts)
 	listOptions := []client.ListOption{
 		client.InNamespace(ts.Namespace),
 		client.MatchingLabels(labelSelector),
@@ -32,7 +33,7 @@ func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts ts
 
 	inSpecs := func(cronJobName string, scrapers []tsv1alpha1.DocSearchScraperSpec) bool {
 		for _, scraper := range scrapers {
-			if cronJobName == fmt.Sprintf(ClusterScraperCronJob, scraper.Name) {
+			if cronJobName == fmt.Sprintf(ClusterScraperCronJob, ts.Name, scraper.Name) {
 				return true
 			}
 		}
@@ -42,7 +43,8 @@ func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts ts
 
 	for _, scraperCronJob := range scraperCronJobs.Items {
 		if ts.Spec.Scrapers == nil || !inSpecs(scraperCronJob.Name, ts.Spec.Scrapers) {
-			err = r.deleteScraper(ctx, &scraperCronJob)
+			cronjob := scraperCronJob
+			err = r.deleteScraper(ctx, &cronjob)
 			if err != nil {
 				return err
 			}
@@ -54,7 +56,14 @@ func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts ts
 	}
 
 	for _, scraper := range ts.Spec.Scrapers {
-		scraperName := fmt.Sprintf(ClusterScraperCronJob, scraper.Name)
+		scraperName := fmt.Sprintf(ClusterScraperCronJob, ts.Name, scraper.Name)
+
+		if len(scraperName) > 52 {
+			err := fmt.Errorf("scraper name '%s' combined with cluster name '%s' exceeds the 52 character limit for CronJobs (got %d characters)", scraper.Name, ts.Name, len(scraperName))
+			r.Recorder.Event(ts, "Warning", "InvalidScraperConfiguration", err.Error())
+			continue
+		}
+
 		scraperExists := true
 		scraperObjectKey := client.ObjectKey{Namespace: ts.Namespace, Name: scraperName}
 
@@ -71,7 +80,7 @@ func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts ts
 		if !scraperExists {
 			r.logger.V(debugLevel).Info("creating scraper cronjob", "cronjob", scraperObjectKey.Name)
 
-			err = r.createScraper(ctx, scraperObjectKey, &ts, &scraper)
+			err = r.createScraper(ctx, scraperObjectKey, ts, &scraper)
 			if err != nil {
 				r.logger.Error(err, "creating scraper cronjob failed", "cronjob", scraperObjectKey.Name)
 				return err
@@ -79,31 +88,92 @@ func (r *TypesenseClusterReconciler) ReconcileScraper(ctx context.Context, ts ts
 		} else {
 			hasChanged := false
 			hasChangedConfig := false
+
+			if len(scraperCronJob.Spec.JobTemplate.Spec.Template.Spec.Containers) == 0 {
+				scraperCronJob.Spec.JobTemplate.Spec.Template.Spec.Containers = append(scraperCronJob.Spec.JobTemplate.Spec.Template.Spec.Containers, corev1.Container{})
+			}
 			container := scraperCronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
 
 			for _, env := range container.Env {
-				if env.Name == "CONFIG" && env.Value != scraper.Config {
+				if env.Name == envTypesenseConfig && env.Value != scraper.Config {
 					hasChangedConfig = true
-					break
+				}
+				if env.Name == envTypesensePort && env.Value != strconv.Itoa(ts.Spec.ApiPort) {
+					hasChangedConfig = true
 				}
 			}
 
-			if scraperCronJob.Spec.Schedule != scraper.Schedule || container.Image != scraper.Image || hasChangedConfig {
+			hasChangedAuthConfig := !apiequality.Semantic.DeepEqual(container.EnvFrom, scraper.GetScraperAuthConfiguration())
+
+			if scraperCronJob.Spec.Schedule != scraper.Schedule || container.Image != scraper.Image || hasChangedConfig || hasChangedAuthConfig {
 				hasChanged = true
 			}
 
 			if hasChanged {
 				r.logger.V(debugLevel).Info("updating scraper cronjob", "cronjob", scraperObjectKey.Name)
 
-				err = r.deleteScraper(ctx, scraperCronJob)
-				if err != nil {
-					r.logger.Error(err, "deleting scraper cronjob failed", "cronjob", scraperObjectKey.Name)
-					return err
+				desired := &batchv1.CronJob{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "batch/v1",
+						Kind:       "CronJob",
+					},
+					ObjectMeta: getObjectMeta(ts, &scraperObjectKey.Name, nil),
+					Spec: batchv1.CronJobSpec{
+						ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+						SuccessfulJobsHistoryLimit: ptr.To[int32](1),
+						FailedJobsHistoryLimit:     ptr.To[int32](1),
+						Schedule:                   scraper.Schedule,
+						JobTemplate: batchv1.JobTemplateSpec{
+							Spec: batchv1.JobSpec{
+								BackoffLimit: ptr.To[int32](0),
+								Template: corev1.PodTemplateSpec{
+									ObjectMeta: metav1.ObjectMeta{
+										Labels: mergeLabels(getDefaultLabels(ts), map[string]string{
+											"ts.opentelekomcloud.com/scraper": scraper.Name,
+										}),
+									},
+									Spec: corev1.PodSpec{
+										ImagePullSecrets: ts.Spec.ImagePullSecrets,
+										RestartPolicy:    corev1.RestartPolicyNever,
+										Containers: []corev1.Container{
+											{
+												Name:  fmt.Sprintf(ClusterScraperCronJobContainer, ts.Name, scraper.Name),
+												Image: scraper.Image,
+												Env: []corev1.EnvVar{
+													{Name: envTypesenseConfig, Value: scraper.Config},
+													{
+														Name: envTypesenseApiKey,
+														ValueFrom: &corev1.EnvVarSource{
+															SecretKeyRef: &corev1.SecretKeySelector{
+																Key: ClusterAdminApiKeySecretKeyName,
+																LocalObjectReference: corev1.LocalObjectReference{
+																	Name: r.getAdminApiKeyObjectKey(ts).Name,
+																},
+															},
+														},
+													},
+													{Name: envTypesenseHost, Value: fmt.Sprintf(ClusterRestService, ts.Name)},
+													{Name: envTypesensePort, Value: strconv.Itoa(ts.Spec.ApiPort)},
+													{Name: envTypesenseProtocol, Value: protocolHttp},
+												},
+												EnvFrom: scraper.GetScraperAuthConfiguration(),
+												Resources: corev1.ResourceRequirements{
+													Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1024m"), corev1.ResourceMemory: resource.MustParse("512Mi")},
+													Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("128m"), corev1.ResourceMemory: resource.MustParse("112Mi")},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
 				}
 
-				err = r.createScraper(ctx, scraperObjectKey, &ts, &scraper)
+				//nolint:staticcheck
+				err = r.Patch(ctx, desired, client.Apply, client.ForceOwnership, client.FieldOwner("typesense-operator"))
 				if err != nil {
-					r.logger.Error(err, "creating scraper cronjob failed", "cronjob", scraperObjectKey.Name)
+					r.logger.Error(err, "updating scraper cronjob failed", "cronjob", scraperObjectKey.Name)
 					return err
 				}
 			}
@@ -129,20 +199,25 @@ func (r *TypesenseClusterReconciler) createScraper(ctx context.Context, key clie
 				Spec: batchv1.JobSpec{
 					BackoffLimit: ptr.To[int32](0),
 					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: mergeLabels(getDefaultLabels(ts), map[string]string{
+								"ts.opentelekomcloud.com/scraper": scraperSpec.Name,
+							}),
+						},
 						Spec: corev1.PodSpec{
 							ImagePullSecrets: ts.Spec.ImagePullSecrets,
 							RestartPolicy:    corev1.RestartPolicyNever,
 							Containers: []corev1.Container{
 								{
-									Name:  fmt.Sprintf(ClusterScraperCronJobContainer, scraperSpec.Name),
+									Name:  fmt.Sprintf(ClusterScraperCronJobContainer, ts.Name, scraperSpec.Name),
 									Image: scraperSpec.Image,
 									Env: []corev1.EnvVar{
 										{
-											Name:  "CONFIG",
+											Name:  envTypesenseConfig,
 											Value: scraperSpec.Config,
 										},
 										{
-											Name: "TYPESENSE_API_KEY",
+											Name: envTypesenseApiKey,
 											ValueFrom: &corev1.EnvVarSource{
 												SecretKeyRef: &corev1.SecretKeySelector{
 													Key: ClusterAdminApiKeySecretKeyName,
@@ -153,16 +228,16 @@ func (r *TypesenseClusterReconciler) createScraper(ctx context.Context, key clie
 											},
 										},
 										{
-											Name:  "TYPESENSE_HOST",
+											Name:  envTypesenseHost,
 											Value: fmt.Sprintf(ClusterRestService, ts.Name),
 										},
 										{
-											Name:  "TYPESENSE_PORT",
+											Name:  envTypesensePort,
 											Value: strconv.Itoa(ts.Spec.ApiPort),
 										},
 										{
-											Name:  "TYPESENSE_PROTOCOL",
-											Value: "http",
+											Name:  envTypesenseProtocol,
+											Value: protocolHttp,
 										},
 									},
 									EnvFrom: scraperSpec.GetScraperAuthConfiguration(),
@@ -200,9 +275,5 @@ func (r *TypesenseClusterReconciler) createScraper(ctx context.Context, key clie
 
 func (r *TypesenseClusterReconciler) deleteScraper(ctx context.Context, scraper *batchv1.CronJob) error {
 	err := r.Delete(ctx, scraper)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return client.IgnoreNotFound(err)
 }
