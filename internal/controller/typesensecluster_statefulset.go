@@ -94,7 +94,8 @@ func (r *TypesenseClusterReconciler) ReconcileStatefulSet(ctx context.Context, t
 				}
 
 				// Prevent scaling operations fighting quorum recovery state
-				if isQuorumRecoveryState(condition.Reason) {
+				isScaleDown := ts.Spec.Replicas < ptr.Deref(sts.Spec.Replicas, 1)
+				if isQuorumRecoveryState(condition.Reason) && !isScaleDown {
 					desiredSts.Spec.Replicas = sts.Spec.Replicas
 				}
 
@@ -631,7 +632,18 @@ func (r *TypesenseClusterReconciler) PurgeStatefulSetPods(ctx context.Context, s
 	var errs []error
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		err := r.Delete(ctx, pod)
+
+		pendingPVC, err := r.isPodPendingPersistentVolumeClaim(ctx, pod)
+		if err != nil {
+			r.logger.Error(err, "failed to inspect pod PVCs before purging statefulset pod", "pod", pod.Name)
+			return err
+		}
+		if pendingPVC {
+			r.logger.V(debugLevel).Info("skipping purge of pod because PVC is still pending", "pod", pod.Name)
+			continue
+		}
+
+		err = r.Delete(ctx, pod)
 		if err != nil {
 			r.logger.Error(err, "failed to delete pod", "pod", pod.Name)
 			errs = append(errs, err)
@@ -673,18 +685,30 @@ func (r *TypesenseClusterReconciler) GetUnscheduledPods(ctx context.Context, sts
 func (r *TypesenseClusterReconciler) RestartUnscheduledPods(ctx context.Context, pods []*corev1.Pod, ts *tsv1alpha1.TypesenseCluster) error {
 	removedAny := false
 	for _, pod := range pods {
-		if isPodUnschedulable(pod) {
-			r.logger.V(debugLevel).Info("removing unscheduled pod", "pod", pod.Name)
+		if !isPodUnschedulable(pod) {
+			continue
+		}
 
-			propagation := metav1.DeletePropagationBackground
-			err := r.Delete(ctx, pod, &client.DeleteOptions{PropagationPolicy: &propagation})
-			if err != nil {
-				r.logger.Error(err, "failed to remove unscheduled pod", "pod", pod.Name)
-			}
+		pendingPVC, err := r.isPodPendingPersistentVolumeClaim(ctx, pod)
+		if err != nil {
+			r.logger.Error(err, "failed to inspect pod PVCs before restarting unscheduled pod", "pod", pod.Name)
+			continue
+		}
+		if pendingPVC {
+			r.logger.V(debugLevel).Info("skipping restart of unscheduled pod because PVC is still pending", "pod", pod.Name)
+			continue
+		}
 
-			if !removedAny {
-				removedAny = err == nil
-			}
+		r.logger.V(debugLevel).Info("removing unscheduled pod", "pod", pod.Name)
+
+		propagation := metav1.DeletePropagationBackground
+		err = r.Delete(ctx, pod, &client.DeleteOptions{PropagationPolicy: &propagation})
+		if err != nil {
+			r.logger.Error(err, "failed to remove unscheduled pod", "pod", pod.Name)
+		}
+
+		if !removedAny {
+			removedAny = err == nil
 		}
 	}
 
@@ -693,6 +717,28 @@ func (r *TypesenseClusterReconciler) RestartUnscheduledPods(ctx context.Context,
 	}
 
 	return nil
+}
+
+func (r *TypesenseClusterReconciler) isPodPendingPersistentVolumeClaim(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim == nil {
+			continue
+		}
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: volume.PersistentVolumeClaim.ClaimName}, pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+
+		if pvc.Status.Phase != corev1.ClaimBound {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func (r *TypesenseClusterReconciler) RestartAllUnscheduledPods(ctx context.Context, sts *appsv1.StatefulSet, ts *tsv1alpha1.TypesenseCluster) error {
@@ -710,15 +756,27 @@ func (r *TypesenseClusterReconciler) RestartAllUnscheduledPods(ctx context.Conte
 	removedAny := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if isPodUnschedulable(pod) {
-			propagation := metav1.DeletePropagationBackground
-			err := r.Delete(ctx, pod, &client.DeleteOptions{
-				PropagationPolicy: &propagation,
-			})
+		if !isPodUnschedulable(pod) {
+			continue
+		}
 
-			if !removedAny {
-				removedAny = err == nil
-			}
+		pendingPVC, err := r.isPodPendingPersistentVolumeClaim(ctx, pod)
+		if err != nil {
+			r.logger.Error(err, "failed to inspect pod PVCs before restarting unscheduled pod", "pod", pod.Name)
+			continue
+		}
+		if pendingPVC {
+			r.logger.V(debugLevel).Info("skipping restart of unscheduled pod because PVC is still pending", "pod", pod.Name)
+			continue
+		}
+
+		propagation := metav1.DeletePropagationBackground
+		err = r.Delete(ctx, pod, &client.DeleteOptions{
+			PropagationPolicy: &propagation,
+		})
+
+		if !removedAny {
+			removedAny = err == nil
 		}
 	}
 

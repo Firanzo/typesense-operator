@@ -108,19 +108,6 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 	clusterStatus := r.getClusterStatus(nodesStatus)
 	r.logger.V(debugLevel).Info("reporting cluster status", "status", clusterStatus)
 
-	if clusterStatus == ClusterStatusSplitBrain {
-		hbv, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
-		if err != nil {
-			return ConditionReasonQuorumNotReady, 0, err
-		}
-
-		if hbv {
-			return ConditionReasonQuorumNotReadyWaitATerm, 0, nil
-		}
-
-		return r.downgradeQuorum(ctx, ts, quorum.NodesListConfigMap, stsObjectKey, sts.Status.ReadyReplicas, int32(quorum.MinRequiredNodes))
-	}
-
 	clusterNeedsAttention := false
 	nodesHealth := make(map[string]bool)
 
@@ -161,6 +148,15 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 		}
 	}
 
+	if clusterStatus == ClusterStatusSplitBrain {
+		_, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
+		if err != nil {
+			return ConditionReasonQuorumNotReady, 0, err
+		}
+
+		return ConditionReasonQuorumNotReadyWaitATerm, 0, nil
+	}
+
 	r.logger.Info("evaluated quorum", "minRequiredNodes", minRequiredNodes, "availableNodes", availableNodes, "healthyNodes", healthyNodes)
 
 	if (queuedWrites > healthyWriteLagThreshold) && healthyNodes > 0 {
@@ -168,16 +164,12 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 	}
 
 	if clusterStatus == ClusterStatusElectionDeadlock {
-		hbv, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
+		_, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
 		if err != nil {
 			return ConditionReasonQuorumNotReady, 0, err
 		}
 
-		if hbv {
-			return ConditionReasonQuorumNotReadyWaitATerm, 0, nil
-		}
-
-		return r.downgradeQuorum(ctx, ts, quorum.NodesListConfigMap, stsObjectKey, int32(healthyNodes), int32(minRequiredNodes))
+		return ConditionReasonQuorumNotReadyWaitATerm, 0, nil
 	}
 
 	if clusterStatus == ClusterStatusNotReady {
@@ -232,52 +224,8 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 }
 
 var (
-	QuorumDowngraded UpdateStatefulSetTrigger = "QuorumDowngraded"
-	QuorumUpgraded   UpdateStatefulSetTrigger = "QuorumUpgraded"
+	QuorumUpgraded UpdateStatefulSetTrigger = "QuorumUpgraded"
 )
-
-func (r *TypesenseClusterReconciler) downgradeQuorum(
-	ctx context.Context,
-	ts *tsv1alpha1.TypesenseCluster,
-	cm *v1.ConfigMap,
-	stsObjectKey client.ObjectKey,
-	healthyNodes, minRequiredNodes int32,
-) (ConditionQuorum, int, error) {
-	// r.logger.Info("downgrading quorum")
-	r.logger.V(debugLevel).Info("scaling statefulset", "sts", stsObjectKey.Name, "triggers", QuorumDowngraded)
-
-	sts, err := r.GetFreshStatefulSet(ctx, stsObjectKey)
-	if err != nil {
-		return ConditionReasonQuorumNotReady, 0, err
-	}
-
-	desiredReplicas := int32(1)
-
-	err = r.ScaleStatefulSet(ctx, stsObjectKey, desiredReplicas)
-	if err != nil {
-		return ConditionReasonQuorumNotReady, 0, err
-	}
-
-	if healthyNodes == 0 && minRequiredNodes == 1 {
-		r.logger.Info("purging quorum")
-
-		err = r.PurgeStatefulSetPods(ctx, sts, ts)
-		if err != nil {
-			return ConditionReasonQuorumNotReady, 0, err
-		}
-	}
-
-	size, updated, err := r.updateConfigMap(ctx, ts, cm, ptr.To[int32](desiredReplicas), true)
-	if err != nil {
-		return ConditionReasonQuorumNotReady, 0, err
-	}
-
-	if updated && ts.Spec.ForceResetPeersConfigOnUpdate {
-		_ = r.forcePodsConfigMapUpdate(ctx, ts)
-	}
-
-	return ConditionReasonQuorumDowngraded, size, nil
-}
 
 func (r *TypesenseClusterReconciler) upgradeQuorum(
 	ctx context.Context,
@@ -366,7 +314,7 @@ func (r *TypesenseClusterReconciler) updatePodReadinessGate(ctx context.Context,
 	err := r.Get(ctx, podObjectKey, pod)
 	if err != nil {
 		r.logger.Error(err, fmt.Sprintf("unable to fetch pod: %s", podObjectKey.Name))
-		return nil
+		return client.IgnoreNotFound(err)
 	}
 
 	patch := client.MergeFrom(pod.DeepCopy())

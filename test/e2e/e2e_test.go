@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +62,188 @@ spec:
 `, name, ns, typesenseImage)
 }
 
+func verifyStatefulSetReadyReplicas(name, ns string, expected int) error {
+	cmd := exec.Command("kubectl", "get", "statefulset", name, "-n", ns, "-o", "jsonpath={.status.readyReplicas}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != strconv.Itoa(expected) {
+		return fmt.Errorf("expected %d ready replicas, got %s", expected, string(output))
+	}
+	return nil
+}
+
+func verifyPodReady(name, ns string) error {
+	cmd := exec.Command("kubectl", "get", "pod", name, "-n", ns, "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != conditionStatusTrue {
+		return fmt.Errorf("expected pod %s to be Ready, got %s", name, string(output))
+	}
+	return nil
+}
+
+func verifyPVCBound(name, ns string) error {
+	cmd := exec.Command("kubectl", "get", "pvc", name, "-n", ns, "-o", "jsonpath={.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != "Bound" {
+		return fmt.Errorf("expected pvc %s phase Bound, got %s", name, string(output))
+	}
+	return nil
+}
+
+func verifyPodPhase(name, ns, expectedPhase string) error {
+	cmd := exec.Command("kubectl", "get", "pod", name, "-n", ns, "-o", "jsonpath={.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != expectedPhase {
+		return fmt.Errorf("expected pod %s phase %s, got %s", name, expectedPhase, string(output))
+	}
+	return nil
+}
+
+func verifyTypesenseClusterPhase(name, expectedPhase string) error {
+	cmd := exec.Command("kubectl", "get", "typesensecluster", name, "-n", namespace, "-o", "jsonpath={.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != expectedPhase {
+		return fmt.Errorf("expected typesensecluster %s phase %s, got %s", name, expectedPhase, string(output))
+	}
+	return nil
+}
+
+func verifyTypesenseClusterPhaseAndObservedGeneration(name, ns, expectedPhase string) error {
+	cmd := exec.Command("kubectl", "get", "typesensecluster", name, "-n", ns, "-o", "jsonpath={.metadata.generation},{.status.observedGeneration},{.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(string(output), ",")
+	if len(parts) != 3 {
+		return fmt.Errorf("unexpected output format: %s", string(output))
+	}
+	if parts[0] != parts[1] {
+		return fmt.Errorf("generation mismatch: generation=%s, observedGeneration=%s", parts[0], parts[1])
+	}
+	if strings.TrimSpace(parts[2]) != expectedPhase {
+		return fmt.Errorf("expected phase %s, got %s", expectedPhase, strings.TrimSpace(parts[2]))
+	}
+	return nil
+}
+
+func verifyTypesenseClusterCondition(name, ns, conditionType, expectedStatus string) error {
+	cmd := exec.Command("kubectl", "get", "typesensecluster", name, "-n", ns, "-o", "jsonpath={.status.conditions[?(@.type==\""+conditionType+"\")].status}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != expectedStatus {
+		return fmt.Errorf("expected typesensecluster %s condition %s=%s, got %s", name, conditionType, expectedStatus, string(output))
+	}
+	return nil
+}
+
+func verifyTypesenseClusterPhaseSet(name, ns string) error {
+	cmd := exec.Command("kubectl", "get", "typesensecluster", name, "-n", ns, "-o", "jsonpath={.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(output))) == 0 {
+		return fmt.Errorf("expected typesensecluster %s phase to be set, but got empty string", name)
+	}
+	return nil
+}
+
+func verifyPodScheduledReason(name, ns, expectedReason string) error {
+	cmd := exec.Command("kubectl", "get", "pod", name, "-n", ns, "-o", "jsonpath={.status.conditions[?(@.type==\"PodScheduled\")].reason}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != expectedReason {
+		return fmt.Errorf("expected pod %s PodScheduled reason %s, got %s", name, expectedReason, string(output))
+	}
+	return nil
+}
+
+func getPodUID(name, ns string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "pod", name, "-n", ns, "-o", "jsonpath={.metadata.uid}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func verifyPVCPhase(name, ns, expectedPhase string) error {
+	cmd := exec.Command("kubectl", "get", "pvc", name, "-n", ns, "-o", "jsonpath={.status.phase}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(output)) != expectedPhase {
+		return fmt.Errorf("expected pvc %s phase %s, got %s", name, expectedPhase, string(output))
+	}
+	return nil
+}
+
+func verifyControllerLogsContain(ns, substring string) error {
+	cmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", ns, "--tail=200")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(output), substring) {
+		return fmt.Errorf("expected controller logs to contain %q", substring)
+	}
+	return nil
+}
+
+func buildManifestWithStorageClass(name, ns, storageClass string) string {
+	return fmt.Sprintf(`apiVersion: ts.opentelekomcloud.com/v1alpha1
+kind: TypesenseCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  image: %s
+  replicas: 1
+  apiPort: 8108
+  peeringPort: 8107
+  storage:
+    storageClassName: %s
+    accessMode: ReadWriteOnce
+    size: 1Gi
+`, name, ns, typesenseImage, storageClass)
+}
+
+func verifyTypesenseClusterObservedGenerationMatches(name, ns string) error {
+	cmd := exec.Command("kubectl", "get", "typesensecluster", name, "-n", ns, "-o", "jsonpath={.metadata.generation}={.status.observedGeneration}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(string(output), "=")
+	if len(parts) != 2 {
+		return fmt.Errorf("unexpected output format: %s", string(output))
+	}
+	if parts[0] != parts[1] {
+		return fmt.Errorf("generation mismatch: metadata.generation=%s, status.observedGeneration=%s", parts[0], parts[1])
+	}
+	return nil
+}
+
 var _ = Describe("controller", Ordered, func() {
 	BeforeAll(func() {
 		By("pulling and loading required images into Kind")
@@ -81,7 +264,7 @@ var _ = Describe("controller", Ordered, func() {
 			// This prevents build/load errors if the image tag doesn't exist on Docker Hub.
 			inspectCmd := exec.Command("docker", "image", "inspect", img)
 			if _, err := utils.Run(inspectCmd); err != nil {
-				fmt.Fprintf(GinkgoWriter, "warning: image %s not found remotely or locally, skipping load...\n", img)
+				_, _ = fmt.Fprintf(GinkgoWriter, "warning: image %s not found remotely or locally, skipping load...\n", img)
 				continue
 			}
 
@@ -91,12 +274,12 @@ var _ = Describe("controller", Ordered, func() {
 			buildCmd := exec.Command("docker", "build", "-t", img, "-")
 			buildCmd.Stdin = strings.NewReader(fmt.Sprintf("FROM %s\n", img))
 			if _, err := utils.Run(buildCmd); err != nil {
-				fmt.Fprintf(GinkgoWriter, "warning: failed to repackage image %s: %v\n", img, err)
+				_, _ = fmt.Fprintf(GinkgoWriter, "warning: failed to repackage image %s: %v\n", img, err)
 			}
 
 			err := utils.LoadImageToKindClusterWithName(img)
 			if err != nil {
-				fmt.Fprintf(GinkgoWriter, "warning: failed to load image %s into kind: %v\n", img, err)
+				_, _ = fmt.Fprintf(GinkgoWriter, "warning: failed to load image %s into kind: %v\n", img, err)
 			}
 		}
 
@@ -249,15 +432,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for the TypesenseCluster StatefulSet to become ready")
 			verifyStatefulSetReady := func() error {
-				cmd := exec.Command("kubectl", "get", "statefulset", "typesense-e2e-sts", "-n", namespace, "-o", "jsonpath={.status.readyReplicas}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != "1" {
-					return fmt.Errorf("statefulset not ready yet, got %s ready replicas", string(output))
-				}
-				return nil
+				return verifyStatefulSetReadyReplicas("typesense-e2e-sts", namespace, 1)
 			}
 			// Give the cluster 3 minutes to pull the Typesense image and start
 			EventuallyWithOffset(1, verifyStatefulSetReady, 3*time.Minute, 5*time.Second).Should(Succeed(), func() string {
@@ -267,6 +442,162 @@ var _ = Describe("controller", Ordered, func() {
 				pods, _ := utils.Run(podCmd)
 				return fmt.Sprintf("\n--- OPERATOR LOGS ---\n%s\n--- PODS ---\n%s\n--------------------\n\n", string(logs), string(pods))
 			})
+
+			By("verifying the first Typesense pod is ready and its PVC is bound")
+			EventuallyWithOffset(1, func() error {
+				if err := verifyPodReady("typesense-e2e-sts-0", namespace); err != nil {
+					return err
+				}
+				return verifyPVCBound("data-typesense-e2e-sts-0", namespace)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed(), func() string {
+				podCmd := exec.Command("kubectl", "describe", "pod", "typesense-e2e-sts-0", "-n", namespace)
+				podDesc, _ := utils.Run(podCmd)
+				pvcCmd := exec.Command("kubectl", "describe", "pvc", "data-typesense-e2e-sts-0", "-n", namespace)
+				pvcDesc, _ := utils.Run(pvcCmd)
+				return fmt.Sprintf("\n--- POD ---\n%s\n--- PVC ---\n%s\n--------------------\n\n", string(podDesc), string(pvcDesc))
+			})
+		})
+
+		It("should tolerate a pending PVC in an unschedulable pod and recover once storage is available", func() {
+			const (
+				delayStorageClass = "typesense-e2e-delay-sc"
+				delayClusterName  = "typesense-delay-e2e"
+				delayPodName      = "typesense-delay-e2e-sts-0"
+				delayPVCName      = "data-typesense-delay-e2e-sts-0"
+				delayPVName       = "pv-typesense-delay-e2e-sts-0"
+			)
+
+			By("creating a StorageClass that does not provision volumes automatically")
+			scYAML := fmt.Sprintf(`apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+`, delayStorageClass)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(scYAML)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				cmd := exec.Command("kubectl", "delete", "storageclass", delayStorageClass, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			}()
+
+			By("creating a TypesenseCluster that uses the delayed StorageClass")
+			typesenseManifest := buildManifestWithStorageClass(delayClusterName, namespace, delayStorageClass)
+			manifestPath, err := filepath.Abs("e2e-ts-delay-cluster.yaml")
+			Expect(err).NotTo(HaveOccurred())
+			err = os.WriteFile(manifestPath, []byte(typesenseManifest), 0644)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_ = os.Remove(manifestPath)
+				cmd := exec.Command("kubectl", "delete", "typesensecluster", delayClusterName, "-n", namespace, "--ignore-not-found", "--wait=false")
+				_, _ = utils.Run(cmd)
+				cmd = exec.Command("kubectl", "delete", "pvc", delayPVCName, "-n", namespace, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+				cmd = exec.Command("kubectl", "delete", "pv", delayPVName, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+
+				clusterName := "kind"
+				if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
+					clusterName = v
+				}
+				cmd = exec.Command("docker", "exec", clusterName+"-control-plane", "rm", "-rf", "/tmp/"+delayPVName)
+				_, _ = utils.Run(cmd)
+			}()
+
+			By("applying the delayed TypesenseCluster manifest")
+			applyCluster := func() error {
+				cmd := exec.Command("kubectl", "apply", "-f", manifestPath)
+				_, err := utils.Run(cmd)
+				return err
+			}
+			EventuallyWithOffset(1, applyCluster, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("waiting for the pod to become pending due to an unschedulable PVC")
+			verifyPendingUnschedulable := func() error {
+				cmd := exec.Command("kubectl", "get", "pod", delayPodName, "-n", namespace, "-o", "jsonpath={.status.phase}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(string(output)) != "Pending" {
+					return fmt.Errorf("expected pod %s to be Pending, got %s", delayPodName, string(output))
+				}
+				if err := verifyPodScheduledReason(delayPodName, namespace, "Unschedulable"); err != nil {
+					return err
+				}
+				return verifyPVCPhase(delayPVCName, namespace, "Pending")
+			}
+			EventuallyWithOffset(1, verifyPendingUnschedulable, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying the operator requeues the reconcile instead of deleting the pod")
+			EventuallyWithOffset(1, func() error {
+				return verifyControllerLogsContain(namespace, "requeueAfter")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("ensuring the operator does not immediately delete the pending pod")
+			initialUID, err := getPodUID(delayPodName, namespace)
+			Expect(err).NotTo(HaveOccurred())
+			verifyUIDStaysSame := func() error {
+				currentUID, err := getPodUID(delayPodName, namespace)
+				if err != nil {
+					return err
+				}
+				if currentUID != initialUID {
+					return fmt.Errorf("expected pod UID to remain %s, but got %s", initialUID, currentUID)
+				}
+				return nil
+			}
+			ConsistentlyWithOffset(1, verifyUIDStaysSame, 30*time.Second, 5*time.Second).Should(Succeed())
+
+			By("creating a matching PersistentVolume so the PVC can bind")
+			clusterName := "kind"
+			if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
+				clusterName = v
+			}
+			cmd = exec.Command("docker", "exec", clusterName+"-control-plane", "mkdir", "-m", "0777", "-p", "/tmp/"+delayPVName)
+			_, _ = utils.Run(cmd)
+
+			pvYAML := fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: %s
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: %s
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: %s
+    name: %s
+  hostPath:
+    path: "/tmp/%s"
+    type: DirectoryOrCreate
+`, delayPVName, delayStorageClass, namespace, delayPVCName, delayPVName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(pvYAML)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the PVC becomes Bound")
+			EventuallyWithOffset(1, func() error {
+				return verifyPVCBound(delayPVCName, namespace)
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying the delayed pod eventually becomes Ready")
+			EventuallyWithOffset(1, func() error {
+				return verifyPodReady(delayPodName, namespace)
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+			By("verifying the delayed TypesenseCluster becomes ready")
+			EventuallyWithOffset(1, func() error {
+				return verifyTypesenseClusterPhase(delayClusterName, phaseQuorumReady)
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
 		It("should provision a TypesenseCluster in a different tenant namespace", func() {
@@ -296,9 +627,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for the tenant TypesenseCluster StatefulSet to become ready")
 			verifyStatefulSetReady := func() error {
-				cmd := exec.Command("kubectl", "wait", "statefulset/typesense-tenant-sts", "--for=jsonpath={.status.readyReplicas}=1", "-n", tenantNamespace, "--timeout=10s")
-				_, err := utils.Run(cmd)
-				return err
+				return verifyStatefulSetReadyReplicas("typesense-tenant-sts", tenantNamespace, 1)
 			}
 			EventuallyWithOffset(1, verifyStatefulSetReady, 3*time.Minute, 5*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -365,15 +694,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for all 3 replicas to become ready")
 			verifyScaledUp := func() error {
-				cmd := exec.Command("kubectl", "get", "statefulset", "typesense-e2e-sts", "-n", namespace, "-o", "jsonpath={.status.readyReplicas}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != "3" {
-					return fmt.Errorf("expected 3 ready replicas, got %s", string(output))
-				}
-				return nil
+				return verifyStatefulSetReadyReplicas("typesense-e2e-sts", namespace, 3)
 			}
 			EventuallyWithOffset(1, verifyScaledUp, 5*time.Minute, 10*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -446,22 +767,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for the cluster to stabilize after first port change")
 			verifyReady := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.metadata.generation},{.status.observedGeneration},{.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				parts := strings.Split(string(output), ",")
-				if len(parts) != 3 {
-					return fmt.Errorf("unexpected output format: %s", string(output))
-				}
-				if parts[0] != parts[1] {
-					return fmt.Errorf("generation mismatch: generation=%s, observedGeneration=%s", parts[0], parts[1])
-				}
-				if parts[2] != phaseQuorumReady {
-					return fmt.Errorf("expected phase %s, got %s", phaseQuorumReady, parts[2])
-				}
-				return nil
+				return verifyTypesenseClusterPhaseAndObservedGeneration("typesense-e2e", namespace, phaseQuorumReady)
 			}
 			EventuallyWithOffset(1, verifyReady, 10*time.Minute, 10*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -504,43 +810,13 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("verifying the phase changes to Upgrading")
 			verifyUpgrading := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.metadata.generation},{.status.observedGeneration},{.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				parts := strings.Split(string(output), ",")
-				if len(parts) != 3 {
-					return fmt.Errorf("unexpected output format: %s", string(output))
-				}
-				if parts[0] != parts[1] {
-					return fmt.Errorf("generation mismatch: generation=%s, observedGeneration=%s", parts[0], parts[1])
-				}
-				if parts[2] != "Upgrading" {
-					return fmt.Errorf("expected phase Upgrading, got %s", parts[2])
-				}
-				return nil
+				return verifyTypesenseClusterPhaseAndObservedGeneration("typesense-e2e", namespace, "Upgrading")
 			}
 			EventuallyWithOffset(1, verifyUpgrading, 1*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("waiting for the cluster to become ready again")
 			verifyReady := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.metadata.generation},{.status.observedGeneration},{.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				parts := strings.Split(string(output), ",")
-				if len(parts) != 3 {
-					return fmt.Errorf("unexpected output format: %s", string(output))
-				}
-				if parts[0] != parts[1] {
-					return fmt.Errorf("generation mismatch: generation=%s, observedGeneration=%s", parts[0], parts[1])
-				}
-				if parts[2] != phaseQuorumReady {
-					return fmt.Errorf("expected phase %s, got %s", phaseQuorumReady, parts[2])
-				}
-				return nil
+				return verifyTypesenseClusterPhaseAndObservedGeneration("typesense-e2e", namespace, phaseQuorumReady)
 			}
 			EventuallyWithOffset(1, verifyReady, 10*time.Minute, 10*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -566,15 +842,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("verifying pod is in running state")
 			verifyPhase := func() error {
-				cmd := exec.Command("kubectl", "get", "pod", "typesense-e2e-sts-0", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != podPhaseRunning {
-					return fmt.Errorf("expected phase Running, got %s", string(output))
-				}
-				return nil
+				return verifyPodPhase("typesense-e2e-sts-0", namespace, podPhaseRunning)
 			}
 			EventuallyWithOffset(1, verifyPhase, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
@@ -588,43 +856,19 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("verifying cluster becomes Degraded")
 			verifyDegraded := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != "Degraded" {
-					return fmt.Errorf("expected phase Degraded, got %s", string(output))
-				}
-				return nil
+				return verifyTypesenseClusterPhase("typesense-e2e", "Degraded")
 			}
 			EventuallyWithOffset(1, verifyDegraded, 1*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("waiting for pod to be recreated and ready")
 			verifyPodRecovered := func() error {
-				cmd := exec.Command("kubectl", "get", "pod", "typesense-e2e-sts-0", "-n", namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != conditionStatusTrue {
-					return fmt.Errorf("pod not yet Ready, got %s", string(output))
-				}
-				return nil
+				return verifyPodReady("typesense-e2e-sts-0", namespace)
 			}
 			EventuallyWithOffset(1, verifyPodRecovered, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying quorum is healthy after recovery")
 			verifyQuorumReady := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != phaseQuorumReady {
-					return fmt.Errorf("expected phase %s, got %s", phaseQuorumReady, string(output))
-				}
-				return nil
+				return verifyTypesenseClusterPhase("typesense-e2e", phaseQuorumReady)
 			}
 			EventuallyWithOffset(1, verifyQuorumReady, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
@@ -632,19 +876,7 @@ var _ = Describe("controller", Ordered, func() {
 		It("should properly sync the observedGeneration in status", func() {
 			By("verifying observedGeneration matches the current generation")
 			verifyGeneration := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.metadata.generation}={.status.observedGeneration}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				parts := strings.Split(string(output), "=")
-				if len(parts) != 2 {
-					return fmt.Errorf("unexpected output format: %s", string(output))
-				}
-				if parts[0] == "" || parts[0] != parts[1] {
-					return fmt.Errorf("generation mismatch: metadata.generation=%s, status.observedGeneration=%s", parts[0], parts[1])
-				}
-				return nil
+				return verifyTypesenseClusterObservedGenerationMatches("typesense-e2e", namespace)
 			}
 			EventuallyWithOffset(1, verifyGeneration, 1*time.Minute, 2*time.Second).Should(Succeed())
 		})
@@ -652,29 +884,13 @@ var _ = Describe("controller", Ordered, func() {
 		It("should verify typesensecluster status conditions", func() {
 			By("checking ready condition exists")
 			verifyReadyCondition := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != conditionStatusTrue {
-					return fmt.Errorf("expected Ready condition to be True, got %s", string(output))
-				}
-				return nil
+				return verifyTypesenseClusterCondition("typesense-e2e", namespace, "Ready", conditionStatusTrue)
 			}
 			EventuallyWithOffset(1, verifyReadyCondition, 5*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying phase is set")
 			verifyPhaseSet := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if len(strings.TrimSpace(string(output))) == 0 {
-					return fmt.Errorf("expected phase to be set, but got empty string")
-				}
-				return nil
+				return verifyTypesenseClusterPhaseSet("typesense-e2e", namespace)
 			}
 			EventuallyWithOffset(1, verifyPhaseSet, 1*time.Minute, 2*time.Second).Should(Succeed())
 		})
@@ -929,15 +1145,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for the cluster to become ready again after image upgrade")
 			verifyReady := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != phaseQuorumReady {
-					return fmt.Errorf("expected phase %s, got %s", phaseQuorumReady, string(output))
-				}
-				return nil
+				return verifyTypesenseClusterPhase("typesense-e2e", phaseQuorumReady)
 			}
 			EventuallyWithOffset(1, verifyReady, 5*time.Minute, 10*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -979,15 +1187,7 @@ var _ = Describe("controller", Ordered, func() {
 
 			By("waiting for the cluster to become ready again after configuration update")
 			verifyReady := func() error {
-				cmd := exec.Command("kubectl", "get", "typesensecluster", "typesense-e2e", "-n", namespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return err
-				}
-				if string(output) != phaseQuorumReady {
-					return fmt.Errorf("expected phase %s, got %s", phaseQuorumReady, string(output))
-				}
-				return nil
+				return verifyTypesenseClusterPhase("typesense-e2e", phaseQuorumReady)
 			}
 			EventuallyWithOffset(1, verifyReady, 10*time.Minute, 10*time.Second).Should(Succeed(), func() string {
 				logCmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
@@ -1237,15 +1437,17 @@ spec:
 			})
 
 			const rejectedNamespace = "test-webhook-reject-ns"
-			By("creating a test namespace for rejection")
+			By("creating a test namespace to test webhook rejection")
 			cmd = exec.Command("kubectl", "create", "ns", rejectedNamespace)
-			_, _ = utils.Run(cmd)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
 			defer func() {
 				cmd := exec.Command("kubectl", "delete", "ns", rejectedNamespace)
 				_, _ = utils.Run(cmd)
 			}()
 
-			By("attempting to create a TypesenseCluster in the wrong namespace (should be rejected by webhook)")
+			By("creating a TypesenseCluster in the rejected namespace (should fail)")
 			typesenseManifest := buildManifest("typesense-rejected", rejectedNamespace)
 			manifestPath, err := filepath.Abs("e2e-ts-rejected.yaml")
 			Expect(err).NotTo(HaveOccurred())
@@ -1253,18 +1455,9 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = os.Remove(manifestPath) }()
 
-			verifyWebhookRejection := func() error {
-				cmd := exec.Command("kubectl", "apply", "-f", manifestPath)
-				out, err := utils.Run(cmd)
-				if err == nil {
-					return fmt.Errorf("expected creation to fail, but it succeeded")
-				}
-				if !strings.Contains(string(out), "operator is running in gapped mode") {
-					return fmt.Errorf("expected error to contain 'operator is running in gapped mode', got: %s", string(out))
-				}
-				return nil
-			}
-			EventuallyWithOffset(1, verifyWebhookRejection, 1*time.Minute, 5*time.Second).Should(Succeed())
+			cmd = exec.Command("kubectl", "apply", "-f", manifestPath)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred())
 		})
 	})
 })

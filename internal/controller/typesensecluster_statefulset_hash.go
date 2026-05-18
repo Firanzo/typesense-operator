@@ -43,11 +43,17 @@ func (r *TypesenseClusterReconciler) shouldUpdateStatefulSet(sts *appsv1.Statefu
 	}
 
 	// SpecReplicasChanged
-	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas &&
-		!isQuorumRecoveryState(condition.Reason) {
-		triggers = append(triggers, SpecReplicasChanged)
-		update = false
-		scaleOnly = true
+	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas {
+		isScaleDown := ts.Spec.Replicas < ptr.Deref(sts.Spec.Replicas, 1)
+		if isScaleDown || !isQuorumRecoveryState(condition.Reason) {
+			triggers = append(triggers, SpecReplicasChanged)
+			if isScaleDown {
+				update = true
+			} else {
+				update = false
+				scaleOnly = true
+			}
+		}
 	}
 
 	// HashAnnotationChanged
@@ -122,9 +128,11 @@ func (r *TypesenseClusterReconciler) shouldEmergencyUpdateStatefulSet(sts *appsv
 		return false
 	}
 
-	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas &&
-		!isQuorumRecoveryState(condition.Reason) {
-		return true
+	if ptr.Deref(sts.Spec.Replicas, 1) != ts.Spec.Replicas {
+		isScaleDown := ts.Spec.Replicas < ptr.Deref(sts.Spec.Replicas, 1)
+		if isScaleDown || !isQuorumRecoveryState(condition.Reason) {
+			return true
+		}
 	}
 
 	// InvalidContainerCount

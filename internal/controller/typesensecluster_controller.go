@@ -44,8 +44,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	tsv1alpha1 "github.com/akyriako/typesense-operator/api/v1alpha1"
 )
@@ -418,6 +420,28 @@ func (r *TypesenseClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&networkingv1.Ingress{}).
 		Owns(&batchv1.CronJob{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapOwnedResourceToTypesenseCluster)).
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.mapOwnedResourceToTypesenseCluster)).
 		Named("typesense-kubernetes-operator").
 		Complete(r)
+}
+
+func (r *TypesenseClusterReconciler) mapOwnedResourceToTypesenseCluster(_ context.Context, obj client.Object) []reconcile.Request {
+	ownerRef := metav1.GetControllerOf(obj)
+	if ownerRef == nil || ownerRef.Kind != "StatefulSet" || ownerRef.APIVersion != "apps/v1" {
+		return nil
+	}
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: obj.GetNamespace(), Name: ownerRef.Name}, sts); err != nil {
+		r.logger.V(debugLevel).Info("unable to resolve owning statefulset", "ownerRef", ownerRef, "error", err)
+		return nil
+	}
+
+	stsOwnerRef := metav1.GetControllerOf(sts)
+	if stsOwnerRef == nil || stsOwnerRef.Kind != "TypesenseCluster" || !strings.HasPrefix(stsOwnerRef.APIVersion, "ts.opentelekomcloud.com/") {
+		return nil
+	}
+
+	return []reconcile.Request{{NamespacedName: client.ObjectKey{Namespace: sts.Namespace, Name: stsOwnerRef.Name}}}
 }
