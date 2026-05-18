@@ -53,7 +53,7 @@ func (r *TypesenseClusterReconciler) ReconcileConfigMap(ctx context.Context, ts 
 		return nil, nil
 	}
 
-	_, updated, err := r.updateConfigMap(ctx, ts, cm, nil, false)
+	updated, err := r.updateConfigMap(ctx, ts, cm, nil, false)
 	if err != nil {
 		return ptr.To[bool](false), err
 	}
@@ -90,7 +90,7 @@ func (r *TypesenseClusterReconciler) createConfigMap(ctx context.Context, key cl
 	return cm, nil
 }
 
-func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *tsv1alpha1.TypesenseCluster, cm *v1.ConfigMap, replicas *int32, resizeOp bool) (int, bool, error) {
+func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *tsv1alpha1.TypesenseCluster, cm *v1.ConfigMap, replicas *int32, resizeOp bool) (bool, error) {
 	stsName := fmt.Sprintf(ClusterStatefulSet, ts.Name)
 	stsObjectKey := client.ObjectKey{
 		Name:      stsName,
@@ -102,13 +102,13 @@ func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *ts
 		if apierrors.IsNotFound(err) {
 			err := r.deleteConfigMap(ctx, cm)
 			if err != nil {
-				return 0, false, err
+				return false, err
 			}
 		} else {
 			r.logger.Error(err, fmt.Sprintf("unable to fetch statefulset: %s", stsName))
 		}
 
-		return 0, false, err
+		return false, err
 	}
 
 	if replicas == nil {
@@ -121,11 +121,11 @@ func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *ts
 
 	nodes, err := r.getNodes(ctx, ts, *replicas, false)
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
 	fallback, err := r.getNodes(ctx, ts, *replicas, true)
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
 
 	availableNodes := len(nodes)
@@ -165,12 +165,12 @@ func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *ts
 		err := r.Patch(ctx, desired, client.Apply, client.ForceOwnership, client.FieldOwner("typesense-operator"))
 		if err != nil {
 			r.logger.Error(err, "updating quorum configuration failed")
-			return 0, false, err
+			return false, err
 		}
 		updated = true
 	}
 
-	return availableNodes, updated, nil
+	return updated, nil
 }
 
 func (r *TypesenseClusterReconciler) deleteConfigMap(ctx context.Context, cm *v1.ConfigMap) error {
@@ -448,19 +448,19 @@ func (r *TypesenseClusterReconciler) getShortName(raftNodeEndpoint string) strin
 	return host
 }
 
-func (r *TypesenseClusterReconciler) hasBootstrapValues(ts *tsv1alpha1.TypesenseCluster, cm *v1.ConfigMap) (bool, error) {
+func (r *TypesenseClusterReconciler) hasBootstrapValues(ts *tsv1alpha1.TypesenseCluster, cm *v1.ConfigMap) error {
 	rawNodeslist, ok := cm.Data["nodes"]
 	if !ok || rawNodeslist == "" {
 		err := fmt.Errorf("configmap is missing 'nodes' key")
-		return false, err
+		return err
 	}
 
 	nodeslist := strings.Split(rawNodeslist, ",")
 	for _, node := range nodeslist {
 		if strings.Contains(node, fmt.Sprintf(ClusterStatefulSet, ts.Name)) {
-			return true, nil
+			return nil
 		}
 	}
 
-	return false, nil
+	return nil
 }

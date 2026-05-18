@@ -149,7 +149,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 	}
 
 	if clusterStatus == ClusterStatusSplitBrain {
-		_, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
+		err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
 		if err != nil {
 			return ConditionReasonQuorumNotReady, 0, err
 		}
@@ -164,7 +164,7 @@ func (r *TypesenseClusterReconciler) ReconcileQuorum(ctx context.Context, ts *ts
 	}
 
 	if clusterStatus == ClusterStatusElectionDeadlock {
-		_, err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
+		err := r.hasBootstrapValues(ts, quorum.NodesListConfigMap)
 		if err != nil {
 			return ConditionReasonQuorumNotReady, 0, err
 		}
@@ -251,7 +251,7 @@ func (r *TypesenseClusterReconciler) upgradeQuorum(
 		return ConditionReasonQuorumNotReady, 0, err
 	}
 
-	_, updated, err := r.updateConfigMap(ctx, ts, cm, &size, true)
+	updated, err := r.updateConfigMap(ctx, ts, cm, &size, true)
 	if err != nil {
 		return ConditionReasonQuorumNotReady, 0, err
 	}
