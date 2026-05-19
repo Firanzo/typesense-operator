@@ -17,7 +17,14 @@ limitations under the License.
 package e2e
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +49,7 @@ const (
 	podPhaseRunning     = "Running"
 	conditionStatusTrue = "True"
 	phaseQuorumReady    = "QuorumReady"
+	badCertBase64       = "YmFkLWNlcnQ="
 )
 
 func buildManifest(name, ns string) string {
@@ -407,6 +415,184 @@ var _ = Describe("controller", Ordered, func() {
 				return nil
 			}
 			EventuallyWithOffset(1, verifyCertInjection, 2*time.Minute, 5*time.Second).Should(Succeed())
+		})
+
+		It("should manage, protect, and autonomously roll over webhook certificates", func() {
+			secretName := "typesense-operator-webhook-cert"
+			var originalCACrt, originalTLSCrt string
+
+			By("verifying the webhook secret is created and populated")
+			verifySecret := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				outCA, err := utils.Run(cmd)
+				if err != nil || len(outCA) == 0 {
+					return fmt.Errorf("missing ca.crt")
+				}
+				originalCACrt = string(outCA)
+
+				cmd = exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['tls\\.crt']}")
+				outTLS, err := utils.Run(cmd)
+				if err != nil || len(outTLS) == 0 {
+					return fmt.Errorf("missing tls.crt")
+				}
+				originalTLSCrt = string(outTLS)
+				return nil
+			}
+			EventuallyWithOffset(1, verifySecret, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("simulating leaf certificate expiration/loss (corrupting tls.crt)")
+			patch := fmt.Sprintf(`{"data":{"tls.crt":"%s"}}`, badCertBase64)
+			cmd := exec.Command("kubectl", "patch", "secret", secretName, "-n", namespace, "--type", "merge", "-p", patch)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the operator regenerates the leaf certificate but keeps the CA intact")
+			var newTLSCrt string
+			verifyLeafRollover := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['tls\\.crt']}")
+				outTLS, err := utils.Run(cmd)
+				if err != nil || len(outTLS) == 0 {
+					return fmt.Errorf("tls.crt not regenerated yet")
+				}
+				newTLSCrt = string(outTLS)
+				if newTLSCrt == originalTLSCrt || newTLSCrt == badCertBase64 {
+					return fmt.Errorf("tls.crt was not rotated")
+				}
+
+				cmd = exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				outCA, _ := utils.Run(cmd)
+				if string(outCA) != originalCACrt {
+					return fmt.Errorf("ca.crt was unexpectedly modified during leaf rotation")
+				}
+				return nil
+			}
+			EventuallyWithOffset(1, verifyLeafRollover, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("simulating leaf certificate nearing expiration (< 30 days)")
+			priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			leafTemplate := &x509.Certificate{
+				SerialNumber: big.NewInt(1),
+				NotBefore:    time.Now().Add(-1 * time.Hour),
+				NotAfter:     time.Now().Add(15 * 24 * time.Hour), // 15 days left
+				DNSNames:     []string{"typesense-operator-webhook-service", "typesense-operator-webhook-service." + namespace, "typesense-operator-webhook-service." + namespace + ".svc", "typesense-operator-webhook-service." + namespace + ".svc.cluster.local"},
+			}
+			leafCertBytes, _ := x509.CreateCertificate(rand.Reader, leafTemplate, leafTemplate, &priv.PublicKey, priv)
+			leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertBytes})
+			expiringLeafB64 := base64.StdEncoding.EncodeToString(leafCertPEM)
+
+			patchLeaf := fmt.Sprintf(`{"data":{"tls.crt":"%s"}}`, expiringLeafB64)
+			cmd = exec.Command("kubectl", "patch", "secret", secretName, "-n", namespace, "--type", "merge", "-p", patchLeaf)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the operator detects impending leaf expiration and rotates it")
+			verifyLeafExpRollover := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['tls\\.crt']}")
+				outTLS, err := utils.Run(cmd)
+				if err != nil || len(outTLS) == 0 {
+					return fmt.Errorf("tls.crt missing")
+				}
+				if string(outTLS) == expiringLeafB64 {
+					return fmt.Errorf("tls.crt was not rotated")
+				}
+				return nil
+			}
+			EventuallyWithOffset(1, verifyLeafExpRollover, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("simulating CA certificate nearing expiration (< 6 months)")
+			caTemplate := &x509.Certificate{
+				SerialNumber:          big.NewInt(2),
+				IsCA:                  true,
+				BasicConstraintsValid: true,
+				NotBefore:             time.Now().Add(-1 * time.Hour),
+				NotAfter:              time.Now().Add(5 * 30 * 24 * time.Hour), // 5 months left
+			}
+			caCertBytes, _ := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &priv.PublicKey, priv)
+			caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertBytes})
+			caExpiringB64 := base64.StdEncoding.EncodeToString(caCertPEM)
+
+			caKeyBytes, _ := x509.MarshalPKCS8PrivateKey(priv)
+			caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: caKeyBytes})
+			caKeyB64 := base64.StdEncoding.EncodeToString(caKeyPEM)
+
+			patchCA := fmt.Sprintf(`{"data":{"ca.crt":"%s", "ca.key":"%s"}}`, caExpiringB64, caKeyB64)
+			cmd = exec.Command("kubectl", "patch", "secret", secretName, "-n", namespace, "--type", "merge", "-p", patchCA)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the operator detects impending CA expiration and rotates the entire chain")
+			verifyCAExpRollover := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				outCA, err := utils.Run(cmd)
+				if err != nil || len(outCA) == 0 {
+					return fmt.Errorf("ca.crt missing")
+				}
+				if string(outCA) == caExpiringB64 {
+					return fmt.Errorf("ca.crt was not rotated")
+				}
+				return nil
+			}
+			EventuallyWithOffset(1, verifyCAExpRollover, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("simulating CA corruption (modifying ca.crt with invalid base64 data)")
+			patch = fmt.Sprintf(`{"data":{"ca.crt":"%s"}}`, badCertBase64)
+			cmd = exec.Command("kubectl", "patch", "secret", secretName, "-n", namespace, "--type", "merge", "-p", patch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the operator refuses to silently overwrite a corrupted CA (Model A protection)")
+			verifyNoSilentRollover := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				outCA, _ := utils.Run(cmd)
+				if string(outCA) != badCertBase64 {
+					return fmt.Errorf("CA was silently rotated, breaking Model A protection")
+				}
+				return nil
+			}
+			ConsistentlyWithOffset(1, verifyNoSilentRollover, 15*time.Second, 2*time.Second).Should(Succeed())
+
+			By("simulating administrator intervention by explicitly deleting the corrupted secret")
+			cmd = exec.Command("kubectl", "delete", "secret", secretName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the operator generates a completely new trust chain after explicit deletion")
+			verifyCARollover := func() error {
+				cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				outCA, err := utils.Run(cmd)
+				if err != nil || len(outCA) == 0 {
+					return fmt.Errorf("ca.crt not regenerated yet")
+				}
+				if string(outCA) == originalCACrt || string(outCA) == badCertBase64 {
+					return fmt.Errorf("ca.crt was not rotated")
+				}
+
+				cmd = exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['tls\\.crt']}")
+				outTLS, _ := utils.Run(cmd)
+				if string(outTLS) == newTLSCrt {
+					return fmt.Errorf("tls.crt was not rotated alongside CA")
+				}
+				return nil
+			}
+			EventuallyWithOffset(1, verifyCARollover, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying the ValidatingWebhookConfiguration has the updated CA bundle")
+			verifyWebhookPatch := func() error {
+				cmd := exec.Command("kubectl", "get", "validatingwebhookconfigurations", "typesense-operator-validating-webhook-configuration", "-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
+				outCA, err := utils.Run(cmd)
+				if err != nil {
+					return err
+				}
+
+				cmd = exec.Command("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "jsonpath={.data['ca\\.crt']}")
+				expectedCA, _ := utils.Run(cmd)
+
+				if string(outCA) != string(expectedCA) {
+					return fmt.Errorf("webhook caBundle does not match secret ca.crt")
+				}
+				return nil
+			}
+			EventuallyWithOffset(1, verifyWebhookPatch, 2*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
 		It("should provision a TypesenseCluster successfully", func() {
