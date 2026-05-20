@@ -119,7 +119,7 @@ func (r *TypesenseClusterReconciler) updateConfigMap(ctx context.Context, ts *ts
 		}
 	}
 
-	nodes, err := r.getNodes(ctx, ts, *replicas, false)
+	nodes, err := r.getNodes(ctx, ts, *replicas, resizeOp)
 	if err != nil {
 		return false, err
 	}

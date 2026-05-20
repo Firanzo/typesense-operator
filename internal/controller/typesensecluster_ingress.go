@@ -3,12 +3,12 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"maps"
 	"strconv"
 	"strings"
 	"text/template"
-	"time"
 
 	tsv1alpha1 "github.com/akyriako/typesense-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -76,6 +76,8 @@ http {
 const (
 	clusterIssuerAnnotationKey = "cert-manager.io/cluster-issuer"
 	nginxConfKey               = "nginx.conf"
+	// NginxConfigHashAnnotationKey is the annotation key for the nginx config hash.
+	NginxConfigHashAnnotationKey = "typesense-operator/nginx-config-hash"
 )
 
 //nolint:gocyclo // ReconcileIngress coordinates multiple child resources
@@ -158,7 +160,6 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 		}
 	}
 
-	configMapUpdated := false
 	if !configMapExists {
 		r.logger.V(debugLevel).Info("creating ingress config map", "configmap", configMapObjectKey.Name)
 
@@ -180,8 +181,6 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 			if err != nil {
 				return err
 			}
-
-			configMapUpdated = true
 		}
 	}
 
@@ -207,10 +206,13 @@ func (r *TypesenseClusterReconciler) ReconcileIngress(ctx context.Context, ts *t
 		replicas = *ts.Spec.Ingress.Replicas
 	}
 
-	podAnnotations := make(map[string]string)
-	if configMapUpdated {
-		podAnnotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+	nginxConf, err := r.getIngressNginxConf(ts)
+	if err != nil {
+		return err
 	}
+
+	podAnnotations := make(map[string]string)
+	podAnnotations[NginxConfigHashAnnotationKey] = fmt.Sprintf("%x", sha256.Sum256([]byte(nginxConf)))
 
 	desiredDeployment := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{

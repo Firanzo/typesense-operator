@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -64,9 +63,7 @@ type TypesenseClusterReconciler struct {
 	InCluster       bool
 	HttpClient      *http.Client
 
-	apiGroupsCache map[string]bool
-	apiGroupsMutex sync.RWMutex
-	serverVersion  string
+	serverVersion string
 }
 
 type TypesenseClusterReconciliationPhase struct {

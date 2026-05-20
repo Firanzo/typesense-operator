@@ -52,16 +52,6 @@ func (r *TypesenseClusterReconciler) IsFeatureSupported(minimum string) (bool, s
 }
 
 func (r *TypesenseClusterReconciler) IsApiGroupDeployed(apiGroup string) (bool, error) {
-	r.apiGroupsMutex.RLock()
-	if supported, exists := r.apiGroupsCache[apiGroup]; exists {
-		r.apiGroupsMutex.RUnlock()
-		if supported {
-			return true, nil
-		}
-	} else {
-		r.apiGroupsMutex.RUnlock()
-	}
-
 	apiGroupList, err := r.DiscoveryClient.ServerGroups()
 	if err != nil {
 		return false, err
@@ -69,21 +59,9 @@ func (r *TypesenseClusterReconciler) IsApiGroupDeployed(apiGroup string) (bool, 
 
 	for _, ag := range apiGroupList.Groups {
 		if ag.Name == apiGroup {
-			r.apiGroupsMutex.Lock()
-			if r.apiGroupsCache == nil {
-				r.apiGroupsCache = make(map[string]bool)
-			}
-			r.apiGroupsCache[apiGroup] = true
-			r.apiGroupsMutex.Unlock()
 			return true, nil
 		}
 	}
 
-	r.apiGroupsMutex.Lock()
-	if r.apiGroupsCache == nil {
-		r.apiGroupsCache = make(map[string]bool)
-	}
-	r.apiGroupsCache[apiGroup] = false
-	r.apiGroupsMutex.Unlock()
 	return false, nil
 }

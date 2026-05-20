@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -237,6 +238,58 @@ var _ = Describe("TypesenseCluster Controller", func() {
 				Namespace: defaultNamespace,
 			}, resolverSvc)).To(Succeed())
 			Expect(resolverSvc.Spec.Ports).To(HaveLen(2))
+		})
+
+		It("should update the reverse proxy deployment when ingress configuration changes", func(ctx context.Context) {
+			tsResource := &tsv1alpha1.TypesenseCluster{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tsResource)).To(Succeed())
+
+			// Enable Ingress with initial directives
+			tsResource.Spec.Ingress = &tsv1alpha1.IngressSpec{
+				Host:             "ts.example.com",
+				HttpDirectives:   ptr.To("client_max_body_size 10m;"),
+				IngressClassName: "nginx",
+			}
+			Expect(k8sClient.Update(ctx, tsResource)).To(Succeed())
+
+			controllerReconciler := newControllerReconciler()
+			runReconcile(ctx, controllerReconciler, reconcile.Request{NamespacedName: typeNamespacedName})
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      fmt.Sprintf(ClusterReverseProxy, resourceName),
+				Namespace: defaultNamespace,
+			}, deploy)).To(Succeed())
+
+			initialHash := deploy.Spec.Template.Annotations[NginxConfigHashAnnotationKey]
+			Expect(initialHash).ToNot(BeEmpty())
+
+			// Update Ingress directives
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tsResource)).To(Succeed())
+			tsResource.Spec.Ingress.HttpDirectives = ptr.To("client_max_body_size 20m;")
+			Expect(k8sClient.Update(ctx, tsResource)).To(Succeed())
+
+			runReconcile(ctx, controllerReconciler, reconcile.Request{NamespacedName: typeNamespacedName})
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      fmt.Sprintf(ClusterReverseProxy, resourceName),
+				Namespace: defaultNamespace,
+			}, deploy)).To(Succeed())
+
+			newHash := deploy.Spec.Template.Annotations[NginxConfigHashAnnotationKey]
+			Expect(newHash).ToNot(BeEmpty())
+			Expect(newHash).ToNot(Equal(initialHash))
+
+			// Re-reconcile without changes and check that the hash remains the same
+			runReconcile(ctx, controllerReconciler, reconcile.Request{NamespacedName: typeNamespacedName})
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      fmt.Sprintf(ClusterReverseProxy, resourceName),
+				Namespace: defaultNamespace,
+			}, deploy)).To(Succeed())
+
+			finalHash := deploy.Spec.Template.Annotations[NginxConfigHashAnnotationKey]
+			Expect(finalHash).To(Equal(newHash))
 		})
 	})
 
